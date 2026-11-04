@@ -62,10 +62,14 @@ jobs:
           check "market-breadth"  "/api/market-breadth"                                 '"total":'
           check "cn-rates"       "/api/cn-rates?days=30"                               '"cn_10y":'
           check "market-turnover" "/api/market-turnover"                                '"total_amount":'
+          check "commodity-quote" "/api/commodity-quote"                                  '"count":7'
+          check "futures-kline"   "/api/futures-kline?symbol=AU0&days=30"                  '"count":30'
+          check "sge-spot"        "/api/sge-spot?instrument=Au99.99&days=30"              '"count":30'
+          check "global-index"    "/api/global-index?symbols=KOSPI"                        '"KOSPI"'
 
           echo "" >> "$SUMMARY"
           if [ "$fail" -eq 0 ]; then
-            echo "全部 8 个端点通过。" >> "$SUMMARY"
+            echo "全部 12 个端点通过。" >> "$SUMMARY"
           else
             echo "**$fail 个端点失败**（详见上方日志的 \`--- body(head) ---\`）。" >> "$SUMMARY"
           fi
