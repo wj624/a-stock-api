@@ -216,6 +216,40 @@
 
 ---
 
+### `GET /api/cn-rates` — 国债收益率曲线（尾部窗口 + 期限利差）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `days` | `250` | 保留最近多少个交易日，`20 ~ 1200` |
+
+`/api/bond-yield` 的**轻量版**：同源（东财 `RPTA_WEB_TREASURYYIELD`），但只翻最少的页数、
+只回尾部窗口，并且**派生期限利差**。250 天约 35 KB，`bond-yield` 同期要几百 KB。
+
+```json
+{
+  "days": 250, "count": 234,
+  "latest": {"date":"2026-11-03","cn_2y":1.2274,"cn_5y":1.3307,"cn_10y":1.621,
+             "cn_30y":2.0508,"cn_10y_2y":0.3936,"cn_5y_2y":0.1033,"cn_30y_10y":0.4298},
+  "derived": {"cn_10y_chg_20d_bp":-6.1,"cn_10y_chg_5d_bp":-0.5,
+              "cn_10y_2y_chg_20d_bp":-2.2,"cn_10y_ma20":1.6496,"inverted":false},
+  "data": [ ... ]
+}
+```
+
+| 字段 | 口径 |
+|---|---|
+| `cn_2y` / `5y` / `10y` / `30y` | 到期收益率 **%**（上游原值） |
+| `cn_10y_2y` | 10Y−2Y 利差 **%**，上游自带；× 100 才是 bp |
+| `cn_5y_2y` / `cn_30y_10y` | 本端点派生（上游没有），单位同为 **%** |
+| `derived.*_bp` | 变化量，单位 **bp** |
+| `derived.inverted` | `cn_10y_2y < 0` 即倒挂 |
+
+> **两个坑**：① 上游偶发返回「只有 `date`、各期限全 `null`」的行（节假日/补数占位），
+> 本端点会**整行剔除**——所以 `count` 会小于请求的 `days`（250 → 约 234），这是正常的，不是漏数。
+> ② 利差列是「%」不是「bp」，`0.3936` 表示 39.4 bp；直接当 bp 用会小 100 倍，而且不报错。
+
+---
+
 ## 3. 单位与口径约定（改代码前必须核对）
 
 | 端点 / 字段 | 单位 | 换算 |
@@ -231,6 +265,9 @@
 | `cn-liquidity` → `derived.*_bp` | bp | 1bp = 0.01 个百分点 |
 | `etf-premium` → `premium_pct` | % | 已乘 100，正=溢价 |
 | `market-breadth` → 各家数 | 家 | 整数 |
+| `cn-rates` → `cn_2y/5y/10y/30y` | % | — |
+| `cn-rates` → `cn_10y_2y` / `cn_5y_2y` / `cn_30y_10y` | **%** | **×100 才是 bp** |
+| `cn-rates` → `derived.*_bp` | bp | 已是 bp，别再乘 |
 | `kline` → `volume` | 手 | — |
 | `fund-nav` → `nav` | 元 | 日期需 +8h 修正 |
 
@@ -260,6 +297,7 @@
 | `/api/cn-liquidity` | *（无直接对应）* | — | `chinamoney.com.cn` | 上游宏观章节只有美债/中债收益率，没有 SHIBOR/DR 资金面 |
 | `/api/etf-premium` | *（无直接对应）* | — | 腾讯价 + 东财净值 | 上游 §12 有「指数估值」，但没有 ETF 折溢价 |
 | `/api/market-breadth` | *（无直接对应）* | — | `push2ex.eastmoney.com` | 上游 §4 有涨停板类函数，但口径/字段不同 |
+| `/api/cn-rates` | `chinabond_yield_curve` 的窄化版 | **11.3** | `datacenter-web.eastmoney.com` | 与 `/api/bond-yield` 同源同表，只回尾部窗口 + 派生利差 |
 
 **「无直接对应」的八个**（`fund-nav` / `market-turnover` / `csindex` / `margin-account` 的市场总量视角，
 以及 2026-11 新增的 `index-valuation` / `cn-liquidity` / `etf-premium` / `market-breadth`）是我们自己实现的，
@@ -412,7 +450,7 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=3242358d09b1b6024863cfdf939def5d 
 
 ---
 
-## 7. 代码结构导览（worker.js，约 1270 行）
+## 7. 代码结构导览（worker.js，约 1345 行）
 
 单文件，无依赖。按顺序大致是：
 
@@ -433,6 +471,7 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=3242358d09b1b6024863cfdf939def5d 
 | 资金面 | `gpost`（带 body 的 POST）+ `cmHistory` + `fetchCnLiquidity` | 同名 |
 | 折溢价 | `txCode` + `fetchTxQuotes` + `fetchLatestNav` + `fetchEtfPremium`（含 `mapLimit` 并发闸门） | 同名 |
 | 市场宽度 | `p2exGet` + `fetchMarketBreadth`（`Promise.allSettled`，允许部分成功） | 同名 |
+| 国债曲线 | `fetchCnRates`（复用 `fetchBondYield`，只翻最少页数 + 剔除全空行 + 派生利差） | `async function fetchCnRates` |
 | 日期工具 | `bjDate(ts)` 北京零点时间戳→日期、`bjToday()` 北京今天（**Worker 跑在 UTC，别直接 `toISOString`**） | 同名 |
 | 路由 | `export default { async fetch(request, env, ctx) }`，`if (url.pathname === "/api/xxx")` 串联，每个分支自带 KV 读写 | 文件后半 |
 | 根路径 | `/` 返回端点索引（自描述，便于人工排查） | 末尾 |
@@ -513,6 +552,7 @@ Cloudflare API Token 与 GitHub PAT **只存在本地环境变量 / GitHub Secre
 | `/api/market-breadth` | 300s（盘中每分钟在变；拿不到有效分布时不写） |
 | `/api/etf-premium` | 600s（净值一天只更新一次，价格收盘后不变） |
 | `/api/cn-liquidity` | 1800s（资金价格日频） |
+| `/api/cn-rates` | 3600s（日频，一天一变） |
 | `/api/etf-shares`（历史日期） | **不写缓存**，见下 |
 
 进程内还有一层：K 线分页 / 深交所翻页时用 `Promise.all` 并发拉取，单次请求的子请求数要控制在免费额度内（50）。
@@ -611,7 +651,7 @@ requests.post(
 |---|---|---|
 | `wj624/rotation-monitor` | `kline` / `csindex` | K 线字段名与日期格式（`date/open/close/high/low/volume`） |
 | `wj624/national-team-etf-flow` | `etf-shares`(SH, SZ→仓库内直连) / `fund-nav` / `trade-calendar` | `shares_10k` 单位、`nav` 时区 |
-| `wj624/etf-lsi` | `etf-shares`(SH) / `fund-nav` / `trade-calendar` | 同上；且它按「空表必须复核」的语义写的，别把 `upstream_error` 去掉 |
+| `wj624/etf-lsi` | `etf-shares`(SH) / `fund-nav` / `trade-calendar` / **`index-valuation` / `cn-liquidity` / `etf-premium` / `market-breadth` / `cn-rates`** | 同上；且它按「空表必须复核」的语义写的，别把 `upstream_error` 去掉。这 5 个新端点支撑看板 ⑨⑩⑪⑫⑬ 与邮件 ⑤ 板块——**任何一个失败都只让对应面板消失**，不会中断它整轮流水线 |
 | `wj624/earl-etf-dashboard` | 计划接入 bond-yield / margin-account / market-turnover | 尚未迁移，字段可协商 |
 
 > `national-team-etf-flow` 与 `etf-lsi` 都**只依赖 Worker、或 Worker + 直连双通道**，没有第三层兜底。任何"看起来无害"的空值语义改动，都会直接变成它们的静默数据缺口。
@@ -643,6 +683,8 @@ requests.post(
 | 2026-11-04 | `etf-shares` 缓存写入加 `shouldCacheDate`：历史日期不再写 KV，250 天回填的写次数 250 → 5 |
 | 2026-11-04 | `deploy.yml` 加**部署后冒烟**：真打 7 个线上端点，结果写进 Step Summary。理由是「部署成功 ≠ 端点可用」——push2 那种「只有 Cloudflare 出口才被拦」的坑，本地怎么测都通 |
 | 2026-11-04 | 首批下游接入：`wj624/etf-lsi` 新增 ⑨境内资金面 ⑩市场宽度 ⑪指数估值 ⑫ETF折溢价 四个看板面板 |
+| 2026-11-04 | **新增 `/api/cn-rates`**（共 15 个）：`bond-yield` 的轻量版——只回尾部窗口（250 天约 35 KB vs 几百 KB）、剔除上游「只有日期、各期限全 null」的占位行、派生 `cn_5y_2y` / `cn_30y_10y` 与 bp 口径的变化量。下游 `wj624/etf-lsi` 接入 ⑬国债曲线面板 + 邮件 5.3 小节 |
+| 2026-11-04 | `deploy.yml` 冒烟从 7 个端点扩到 8 个（加入 `cn-rates`） |
 
 ---
 
