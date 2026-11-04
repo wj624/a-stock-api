@@ -36,7 +36,7 @@ function normDate(d) {
 
 function decDate(iso) {
   // iso: YYYY-MM-DD -> 前一天（用于分页游标）
-  const t = new Date(iso.replace(/-/g, "/") + "T00:00:00Z");
+  const t = new Date(iso + "T00:00:00Z");
   t.setUTCDate(t.getUTCDate() - 1);
   return t.toISOString().slice(0, 10);
 }
@@ -138,6 +138,7 @@ async function fetchCsindex(symbol, start, end) {
 // ── 主路由 ─────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
+   try {
     const url = new URL(request.url);
 
     // /api/kline?symbol=sz399006&start=2010-01-01
@@ -208,5 +209,9 @@ export default {
         "中证红利低波": "H30269",
       },
     });
+   } catch (e) {
+    console.error("worker error:", e && e.stack ? e.stack : e);
+    return json({ error: "worker_exception", message: String((e && e.message) || e) }, 500);
+   }
   },
 };
