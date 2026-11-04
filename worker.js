@@ -158,13 +158,24 @@ async function gfetch(url, headers, ms = 20000) {
 const SSE_ETF_URL = "https://query.sse.com.cn/commonQuery.do";
 const SZSE_ETF_URL = "https://fund.szse.cn/api/report/ShowReport/data";
 
+// 与国内本机可稳定跑通的 Python 客户端保持一致（完整 Chrome UA + Accept 通配符 + 全套 pageHelp 参数）。
+// 2026-11-04 对照实验结论：**这不是成功率低的原因**——用旧版的 `UA: Mozilla/5.0` 从住宅宽带
+// 请求 7 个日期同样是 7/7 全中。真正的原因是上交所对机房/共享出口 IP 的区别对待，
+// 换请求头救不了，只能靠「重试 + 另一条通道复核」。
+const SSE_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Referer": "https://www.sse.com.cn/",
+  "Accept": "*/*",
+};
+
 async function fetchSseEtfShares(date) {
-  const url = `${SSE_ETF_URL}?sqlId=COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L`
-    + `&STAT_DATE=${encodeURIComponent(date)}&isPagination=true`
-    + `&pageHelp.pageSize=10000&pageHelp.beginPage=1&pageHelp.endPage=1`;
-  const res = await gfetch(url, {
-    "User-Agent": "Mozilla/5.0", "Referer": "https://www.sse.com.cn/",
-  });
+  // 参数与 akshare / 本机 Python 客户端逐项对齐（缺 pageHelp.pageNo、pageHelp.cacheSize 也会被挑剔）
+  const url = `${SSE_ETF_URL}?isPagination=true&pageHelp.pageSize=10000`
+    + `&pageHelp.pageNo=1&pageHelp.beginPage=1&pageHelp.cacheSize=1&pageHelp.endPage=1`
+    + `&sqlId=COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L`
+    + `&STAT_DATE=${encodeURIComponent(date)}`;
+  const res = await gfetch(url, SSE_HEADERS, 15000);
   if (!res.ok) throw new Error("SSE HTTP " + res.status);
   const j = await res.json();
   const rows = (j && j.result) || [];
