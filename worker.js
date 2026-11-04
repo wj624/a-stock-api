@@ -20,6 +20,8 @@
 //   - 期货日K /api/futures-kline：新浪 InnerFuturesNewService（主力连续，2005/2008 起）
 //   - 上金所现货 /api/sge-spot：sge.com.cn/graph/Dailyhq（Au99.99 / Ag(T+D)，2016-12 起）
 //   - 全球指数 /api/global-index：新浪 znb_（KOSPI / 恒生 / 富时100，仅实时）
+//   - 跨资产比价 /api/macro-ratios：外盘日K（GC/SI/CL/OIL/HG/CAD）+ znb_KOSPI，
+//     算金银比/金油比/铜金比的当前值、20日变化、250日分位，以及 KOSPI/GOLD 固定阈值信号
 //
 // 注意：本仓库是"代码老家"；真正被各看板调用的是「部署后的 Worker 网址」，不是 GitHub 仓库本身。
 
@@ -1083,6 +1085,101 @@ async function fetchGlobalIndex(symbols) {
 }
 
 
+// ── 跨资产比价：外盘连续合约日K + KOSPI/GOLD 固定阈值 ──────────
+const GLOBAL_FUT_KLINE_URL = "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/"
+  + "var%20_{code}=/GlobalFuturesService.getGlobalFuturesDailyKLine";
+const MACRO_SYMBOLS = ["GC", "SI", "CL", "OIL", "HG", "CAD"];
+const KOSPI_HI = 1.85;
+const KOSPI_LO = 1.10;
+
+function mround(x, n) {
+  if (x == null || !Number.isFinite(x)) return null;
+  const p = Math.pow(10, n);
+  return Math.round(x * p) / p;
+}
+
+async function fetchGlobalFuturesDaily(code) {
+  const u = GLOBAL_FUT_KLINE_URL.replace("{code}", code)
+    + "?symbol=" + encodeURIComponent(code);
+  const res = await gfetch(u, SINA_HDR, 20000);
+  if (!res.ok) throw new Error("global futures kline " + code + " HTTP " + res.status);
+  const text = await gbkText(res);
+  const p = text.indexOf("var _");
+  if (p < 0) throw new Error("global futures kline " + code + " 不是预期 JSONP");
+  const seg = text.slice(p);
+  const op = seg.indexOf("("), cp = seg.lastIndexOf(")");
+  if (op < 0 || cp <= op) throw new Error("global futures kline " + code + " 括号缺失");
+  const body = seg.slice(op + 1, cp).trim();
+  let items;
+  try { items = JSON.parse(body); } catch (e) { throw new Error("global futures kline " + code + " 非 JSON"); }
+  if (!Array.isArray(items)) throw new Error("global futures kline " + code + " 返回不是数组");
+  const m = new Map();
+  for (const r of items) {
+    const day = String(r.date || "");
+    const close = cnum(r.close);
+    if (day && close != null && close > 0) m.set(day, close);
+  }
+  if (!m.size) throw new Error("global futures kline " + code + " 无有效收盘价");
+  return m;
+}
+
+function ratioStats(a, b, scale) {
+  const dates = [...a.keys()].filter((d) => b.has(d) && b.get(d) > 0).sort();
+  if (!dates.length) return null;
+  const vals = dates.map((d) => a.get(d) / b.get(d) * scale);
+  const n = vals.length;
+  const cur = vals[n - 1];
+  const prev = vals[Math.max(0, n - 21)];
+  const win = vals.slice(-250);
+  return {
+    value: mround(cur, 3),
+    chg20_pct: mround((cur / prev - 1) * 100, 2),
+    pct250: mround(win.filter((x) => x <= cur).length / win.length * 100, 1),
+    min250: mround(Math.min(...win), 3),
+    max250: mround(Math.max(...win), 3),
+    asof: dates[n - 1],
+    n: n,
+  };
+}
+
+async function fetchMacroRatios() {
+  const settled = await Promise.all(MACRO_SYMBOLS.map(async (s) => {
+    try { return [s, await fetchGlobalFuturesDaily(s)]; }
+    catch (e) { return [s, null, String(e.message || e)]; }
+  }));
+  const maps = {}, errs = [];
+  for (const [s, m, err] of settled) {
+    if (m) maps[s] = m; else errs.push(s + ": " + err);
+  }
+  for (const s of ["GC", "SI", "CL", "HG"]) {
+    if (!maps[s]) throw new Error("核心品种缺失 " + s + "；" + errs.join(" | "));
+  }
+  const kg = await sinaHq(["znb_KOSPI"]);
+  const kf = kg["znb_KOSPI"];
+  const kospi = kf && cnum(kf[1]);
+  if (kospi == null || kospi <= 0) throw new Error("znb_KOSPI 无有效报价");
+  const gcDates = [...maps.GC.keys()].sort();
+  const gold = maps.GC.get(gcDates[gcDates.length - 1]);
+  const kgVal = kospi / gold;
+  return {
+    asof: gcDates[gcDates.length - 1],
+    gold_close: mround(gold, 3),
+    kospi: mround(kospi, 2),
+    gold_silver: ratioStats(maps.GC, maps.SI, 1),
+    gold_oil: ratioStats(maps.GC, maps.CL, 1),
+    copper_gold: ratioStats(maps.HG, maps.GC, 1000),
+    kospi_gold: {
+      value: mround(kgVal, 4),
+      hi: KOSPI_HI, lo: KOSPI_LO,
+      signal: kgVal > KOSPI_HI ? "sell" : (kgVal < KOSPI_LO ? "buy" : "neutral"),
+      dist_hi_pct: mround((KOSPI_HI / kgVal - 1) * 100, 2),
+      dist_lo_pct: mround((KOSPI_LO / kgVal - 1) * 100, 2),
+    },
+    errs: errs,
+  };
+}
+
+
 // ── 主路由 ─────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -1621,6 +1718,36 @@ export default {
       }
     }
 
+    // /api/macro-ratios  跨资产比价：金银比 / 金油比 / 铜金比 + KOSPI/GOLD 固定阈值信号
+    if (url.pathname === "/api/macro-ratios") {
+      const key = "macroratios:v1";
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const r = await fetchMacroRatios();
+        const payload = {
+          updated: Date.now(), ...r,
+          definitions: {
+            gold_silver: "纽约黄金 GC(美元/盎司) ÷ 纽约白银 SI(美元/盎司)",
+            gold_oil: "纽约黄金 GC ÷ WTI 原油 CL(美元/桶)",
+            copper_gold: "美铜 HG(美分/磅) ÷ 纽约黄金 GC × 1000",
+            kospi_gold: "KOSPI 点位 ÷ 纽约黄金 GC 日K收盘(美元/盎司)",
+          },
+          note: "外盘为新浪 GlobalFuturesService 连续合约日K，最后一根是当日盘中快照、非结算价；"
+            + "KOSPI 为 znb_ 实时/收盘快照，两者时点略有错位。"
+            + "pct250 为近 250 交易日分位(0=最低,100=最高)，chg20_pct 为 20 交易日前至今变化。"
+            + "KOSPI/GOLD 采用固定阈值 1.85 / 1.10，dist_hi_pct / dist_lo_pct 表示当前值需变动多少百分比才触线。",
+          history_supported: true,
+        };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "macro-ratios fetch failed", message: String(e.message || e) }, 502);
+      }
+    }
+
     return json({
       service: "a-stock-api",
       source: "腾讯财经 + 中证指数官网（改编自 simonlin1212/a-stock-data, Apache-2.0）",
@@ -1644,6 +1771,7 @@ export default {
         "futures-kline": "/api/futures-kline?symbol=AU0&days=250  (期货主力连续日K)",
         "sge-spot": "/api/sge-spot?instrument=Au99.99&days=250  (上金所黄金/白银现货日线)",
         "global-index": "/api/global-index?symbols=KOSPI  (KRX:KOSPI 等全球指数实时，无历史)",
+        "macro-ratios": "/api/macro-ratios  (金银比/金油比/铜金比 + KOSPI-GOLD 阈值信号)",
       },
       examples: {
         "创业板指": "sz399006",
