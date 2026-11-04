@@ -303,7 +303,13 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=3242358d09b1b6024863cfdf939def5d 
   npx --yes wrangler deploy
 ```
 
-> **陷阱**：`deploy.yml` 监听 `push: main`。如果你只本地 `wrangler deploy` 而没 push，仓库代码就是旧的，下一个人 push 会把你线上的改动覆盖掉。**两种方式必须最终让两边一致。**
+> **陷阱 1**：`deploy.yml` 监听 `push: main`。如果你只本地 `wrangler deploy` 而没 push，仓库代码就是旧的，下一个人 push 会把你线上的改动覆盖掉。**两种方式必须最终让两边一致。**
+>
+> **陷阱 2**：push 之后**必须去看 Actions 是否变绿**。2026-11-04 之前这个仓库的 Secret 是空的，
+> 每次 push 部署都静默失败（只有最后一步红），线上版本靠人工本地部署维持。详见 §8。
+>
+> 验证部署真的生效：拿 `wrangler deploy` 输出（或 Actions 日志最后一行）的 Version ID，
+> 与 `npx wrangler deployments list` 对比，或直接看端点响应里的数值是否已按新逻辑变化。
 
 ### Step 6 · 线上验证
 
@@ -380,10 +386,30 @@ wrangler deploy
 
 ### 方式 B：GitHub Actions 自动部署（当前生效）
 
-`push` 到 `main` 即触发 `.github/workflows/deploy.yml`。需要的两个 Secret（已配置）：
+`push` 到 `main` 即触发 `.github/workflows/deploy.yml`。需要的两个 Secret：
 
 - `CLOUDFLARE_API_TOKEN`
-- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_ACCOUNT_ID` = `3242358d09b1b6024863cfdf939def5d`
+
+> **2026-11-04 踩过的坑（务必先查这里）**：这两个 Secret 曾经是**空值**，导致
+> `deploy.yml` 的每一步都"成功"，只有最后 `wrangler deploy` 失败，报：
+>
+> ```
+> ✘ [ERROR] In a non-interactive environment, it's necessary to set
+>   a CLOUDFLARE_API_TOKEN environment variable for wrangler to work.
+> ```
+>
+> 因为一直有人用本地 `wrangler deploy`，线上其实是新的、仓库却是靠手工同步，
+> **自动部署形同虚设却没人发现**。排错顺序固定为：先看 `deploy.yml` 最后一步的日志，
+> 再看 Secret 是否存在：
+>
+> ```bash
+> gh api repos/wj624/a-stock-api/actions/secrets        # total_count 必须为 2
+> ```
+>
+> 补 Secret 需要带 `secrets:write` 的 PAT，且值要用仓库公钥做 SealedBox 加密后
+> `PUT /repos/{owner}/{repo}/actions/secrets/{name}`（`key_id` 与 `key` 取自
+> `GET .../actions/secrets/public-key`）。**别把明文 token 交给任何第三方页面**。
 
 ### 凭证纪律
 
@@ -466,6 +492,7 @@ requests.post(
 | `/api/market-turnover` 返回 `turnover HTTP 502` | 走到东财 push2 了（WAF 拦 Cloudflare） | 必须走腾讯 `qt.gtimg.cn`，别改回 push2 |
 | 某个"新功能"端点返回 401 | 上游有反爬（如乐咕乐股 `acw_tc` 阿里云盾） | 放弃该端点并在 §12 登记原因，别硬扛 |
 | 部署成功但行为没变 | 只本地 deploy 未 push，或 Actions 还在跑 | 看 Actions 状态；或确认 `wrangler deploy` 输出的 Version ID 已变 |
+| Actions 只有 `Deploy` 一步红，报 `necessary to set a CLOUDFLARE_API_TOKEN` | 仓库 Secret 为空（曾发生） | 按 §8 补 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` |
 | 全市场快照类需求做不出来 | 东财单页强制 100 条，5900 只需 60 页 > 免费 Worker 子请求上限 | 见 §12，用替代端点 |
 
 ---
@@ -500,6 +527,8 @@ requests.post(
 | 2026-11 上旬 | 初版 10 端点：kline / csindex / etf-shares / fund-flow / research / fund-nav / trade-calendar / bond-yield / margin-account / market-turnover |
 | 2026-11-04 | `market-turnover` 从东财 push2 改腾讯（push2 WAF 502） |
 | 2026-11-04 | `etf-shares`：空结果不再写 KV；失败回 `upstream_error`；上交所请求重试 3 次/400ms；请求头与本机客户端对齐（附对照实验：根因是出口 IP 而非 UA） |
+| 2026-11-04 | **修复自动部署**：仓库 Actions Secrets 一直为空，`deploy.yml` 的 `wrangler deploy` 从未成功；补齐后验证通过（Version ID `e20dd390`） |
+| 2026-11-04 | README 重写为维护手册：AI 同步提示词、上游映射表、Runbook、排障手册、下游契约 |
 
 ---
 
