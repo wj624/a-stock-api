@@ -20,32 +20,67 @@
 |---|---|---|
 | `symbol` | 指数代码（腾讯格式） | `sz399006` |
 | `period` | `day` / `week` / `month` | `day` |
-| `count` | 返回条数（≤1200） | `365` |
-| `start` | 起始日期 `YYYY-MM-DD` | `2015-01-01` |
+| `start` | 起始日期 `YYYY-MM-DD`（取完整历史，不受条数限制） | `2015-01-01` |
 
-示例：`/api/kline?symbol=sz399006&period=day&count=365`
+> 该端点会**自动分页取全量历史**（腾讯单次最多约 1200 条，Worker 会向前翻页补齐到 `start`），返回 `start` 至今的全部交易日数据，无需手动翻页。
+
+示例：`/api/kline?symbol=sz399006&start=2010-01-01`
 
 返回：
 ```json
 {
   "symbol": "sz399006",
   "period": "day",
-  "count": 365,
+  "count": 3900,
   "updated": 1730600000000,
   "data": [
-    { "date": "2025-01-02", "open": 2136.92, "close": 2060.44, "high": 2137.65, "low": 2040.38, "volume": 196587395 }
+    { "date": "2010-06-01", "open": 1031.20, "close": 1038.37, "high": 1042.66, "low": 1018.22, "volume": 28910232 },
+    { "date": "2026-11-03", "open": 2136.92, "close": 2060.44, "high": 2137.65, "low": 2040.38, "volume": 196587395 }
   ]
 }
 ```
 
 常用代码：`sz399006` 创业板指 · `sh000300` 沪深300 · `sh000001` 上证指数 · `sh000919` 中证红利（视腾讯覆盖）。
 
+### `GET /api/csindex` — 中证自定义指数日线（如 H30269 红利低波）
+
+腾讯对自定义中证指数（H 开头）往往没有日线，本端点直连**中证指数官网** `csindex.com.cn` 补上。
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `symbol` | 指数代码（中证格式，如 `H30269`） | `H30269` |
+| `start` | 起始日期 `YYYYMMDD` | `20100101` |
+| `end` | 结束日期 `YYYYMMDD`（默认今天） | 今天 |
+
+示例：`/api/csindex?symbol=H30269&start=20160803`
+
+返回（字段与 kline 对齐：`date/open/close/high/low/volume`）：
+```json
+{
+  "symbol": "H30269",
+  "start": "20160803",
+  "end": "20261104",
+  "count": 2488,
+  "updated": 1730600000000,
+  "data": [
+    { "date": "2016-08-03", "open": null, "close": 7145.8, "high": null, "low": null, "volume": null },
+    { "date": "2026-11-03", "open": 11295.54, "high": 11358.59, "low": 11128.73, "close": 11335.6, "volume": 12345678 }
+  ]
+}
+```
+
+> 注：中证官网对指数基日（inception）当天的 `open/high/low/volume` 常为 `null`，这是上游数据本身如此，与原 AKShare `stock_zh_index_hist_csindex` 行为一致，看板侧已兼容。
+
 ## 看板里怎么调用
 
 ```js
-const res = await fetch("https://a-stock-api.<subdomain>.workers.dev/api/kline?symbol=sz399006&count=365");
+const res = await fetch("https://a-stock-api.wj4020410.workers.dev/api/kline?symbol=sz399006&start=2010-01-01");
 const { data } = await res.json();
 // data = [{ date, open, close, high, low, volume }, ...]
+
+// 中证自定义指数（如红利低波 H30269）
+const res2 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/csindex?symbol=H30269&start=20160803");
+const { data: hldb } = await res2.json();
 ```
 
 已开启 `Access-Control-Allow-Origin: *`，github.io / pages.dev 等静态看板可直接 `fetch`。
