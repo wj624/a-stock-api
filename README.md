@@ -157,11 +157,13 @@
 
 | 参数 | 说明 | 默认 |
 |---|---|---|
-| `secids` | 东财 secid 列表（逗号分隔） | `1.000001,0.399001` |
+| `symbols` | 腾讯格式代码（逗号分隔），也兼容东财 `secids=1.000001` 写法 | `sh000001,sz399001` |
 
-东财 push2 指数实时行情（`ulist.np`）。返回各指数 `{code, name, price, amount}` 与合计 `total_amount`（成交额单位：元）。默认给的是「上证指数 + 深证成指」，两者之和即两市成交额。
+腾讯行情 `qt.gtimg.cn`（零鉴权、不封 IP）。返回各指数 `{code, name, price, amount}` 与合计 `total_amount`（成交额单位：元）。默认给的是「上证指数 + 深证成指」，两者之和即两市成交额。
 
-示例：`/api/market-turnover?secids=1.000001,0.399001,0.399006`
+> 注：东财 push2 对 Cloudflare 出口 IP 有 WAF 拦截（502），故成交额走腾讯行情；`symbols` 支持 `sh000001` 或 `1.000001` 两种写法。
+
+示例：`/api/market-turnover?symbols=sh000001,sz399001,sz399006`
 
 > **未提供（及原因）**：`/api/index-valuation`（指数历史 PE/PB）——上游乐咕乐股有阿里云反爬，Worker 无法稳定复刻；`/api/spot`（全市场逐股快照）——东财单页强制 100 条、全市场 5900+ 只需 60 页，超免费 Worker 子请求上限，成交额需求请用 `/api/market-turnover`。
 
