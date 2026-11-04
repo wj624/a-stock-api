@@ -10,7 +10,7 @@
 //   - 交易日历 /api/trade-calendar：派生自上证指数日K线
 //   - 国债收益率 /api/bond-yield：东财 datacenter（RPTA_WEB_TREASURYYIELD）
 //   - 两融账户 /api/margin-account：东财 datacenter-web（RPTA_WEB_MARGIN_DAILYTRADE）
-//   - 两市成交额 /api/market-turnover：东财 push2 指数实时行情（ulist.np）
+//   - 两市成交额 /api/market-turnover：腾讯行情 qt.gtimg.cn（指数实时成交额）
 //
 // 注意：本仓库是"代码老家"；真正被各看板调用的是「部署后的 Worker 网址」，不是 GitHub 仓库本身。
 
@@ -426,14 +426,26 @@ async function fetchMarginAccount(start, maxPages) {
   return all;
 }
 
-// ── 两市成交额：东财指数实时行情（ulist.np，f6=成交额 元）───────
-async function fetchMarketTurnover(secids) {
-  const url = `https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids=${encodeURIComponent(secids)}&fields=f2,f6,f12,f14&ut=bd1d9ddb04089700cf9c27f6f7426281`;
-  const res = await gfetch(url, { "User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/" });
+// ── 两市成交额：腾讯行情 qt.gtimg.cn（指数实时成交额，零鉴权不封 IP）──
+// 东财 push2 对 Cloudflare 出口 IP 有 WAF 拦截（502），改用腾讯；[35]="价格/成交量/成交额(元)"
+async function fetchMarketTurnover(symbols) {
+  const url = `https://qt.gtimg.cn/q=${encodeURIComponent(symbols)}`;
+  const res = await gfetch(url, { "User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/" });
   if (!res.ok) throw new Error("turnover HTTP " + res.status);
-  const j = await res.json();
-  const diff = (j.data && j.data.diff) || [];
-  const rows = diff.map((r) => ({ code: r.f12, name: r.f14, price: num(r.f2), amount: num(r.f6) }));
+  const buf = await res.arrayBuffer();
+  let text;
+  try { text = new TextDecoder("gbk").decode(buf); } catch (e) { text = new TextDecoder("utf-8").decode(buf); }
+  const rows = [];
+  for (const seg of text.split(";")) {
+    const s = seg.trim();
+    const m = s.match(/^v_[a-z0-9]+="([\s\S]*)"$/);
+    if (!m) continue;
+    const parts = m[1].split("~");
+    if (parts.length < 38) continue;
+    const amountPart = (parts[35] || "").split("/")[2];
+    const amount = amountPart ? parseFloat(amountPart) : (parts[37] ? parseFloat(parts[37]) * 10000 : null);
+    rows.push({ code: parts[2], name: parts[1], price: num(parts[3]), amount: amount });
+  }
   const total = rows.reduce((s, r) => s + (r.amount || 0), 0);
   return { rows, total };
 }
@@ -662,17 +674,25 @@ export default {
       }
     }
 
-    // /api/market-turnover?secids=1.000001,0.399001
+    // /api/market-turnover?symbols=sh000001,sz399001  (兼容 secids=1.000001,0.399001)
     if (url.pathname === "/api/market-turnover") {
-      const secids = url.searchParams.get("secids") || "1.000001,0.399001";
-      const key = `turnover:${secids}`;
+      const raw = url.searchParams.get("symbols") || url.searchParams.get("secids") || "sh000001,sz399001";
+      const symbols = raw.split(",").map((t) => {
+        t = t.trim().toLowerCase();
+        if (t.includes(".")) {
+          const [mkt, code] = t.split(".");
+          return (mkt === "1" ? "sh" : mkt === "0" ? "sz" : mkt) + code;
+        }
+        return t;
+      }).filter(Boolean).join(",");
+      const key = `turnover:${symbols}`;
       try {
         const cached = await env.CACHE.get(key);
         if (cached) return json({ ...JSON.parse(cached), cached: true });
       } catch (_) { /* ignore */ }
       try {
-        const { rows, total } = await fetchMarketTurnover(secids);
-        const payload = { secids, count: rows.length, total_amount: total, unit: "amount = 元", updated: Date.now(), data: rows };
+        const { rows, total } = await fetchMarketTurnover(symbols);
+        const payload = { symbols, count: rows.length, total_amount: total, unit: "amount = 元", updated: Date.now(), data: rows };
         ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 300 }).catch(() => {}));
         return json(payload);
       } catch (e) {
@@ -693,7 +713,7 @@ export default {
         "trade-calendar": "/api/trade-calendar?start=2010-01-01  (交易日历，派生自上证指数K线)",
         "bond-yield": "/api/bond-yield?start=2015-01-01&include_us=0  (国债收益率 %)",
         "margin-account": "/api/margin-account?start=2018-01-01  (两融账户统计)",
-        "market-turnover": "/api/market-turnover?secids=1.000001,0.399001  (两市成交额 元)",
+        "market-turnover": "/api/market-turnover?symbols=sh000001,sz399001  (两市成交额 元)",
       },
       examples: {
         "创业板指": "sz399006",
