@@ -1,0 +1,9 @@
+name = "a-stock-api"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+account_id = "3242358d09b1b6024863cfdf939def5d"
+
+# KV 命名空间（已创建：a-stock-api-cache）
+kv_namespaces = [
+  { binding = "CACHE", id = "77fd8e2bda9a4fc5bb032c69e88973bc" }
+]
