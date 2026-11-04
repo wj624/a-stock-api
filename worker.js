@@ -6,6 +6,11 @@
 //   - ETF 份额 /api/etf-shares：上交所 query.sse.com.cn（按日期历史） + 深交所 fund.szse.cn（当前快照）
 //   - 个股资金流 /api/fund-flow：新浪 MoneyFlow.ssl_qsfx_zjlrqs（日度四档单净额）
 //   - 研报 /api/research：东财 reportapi.eastmoney.com（含评级/目标价/机构）
+//   - 基金净值 /api/fund-nav：东财 fund.eastmoney.com/pingzhongdata（Data_netWorthTrend）
+//   - 交易日历 /api/trade-calendar：派生自上证指数日K线
+//   - 国债收益率 /api/bond-yield：东财 datacenter（RPTA_WEB_TREASURYYIELD）
+//   - 两融账户 /api/margin-account：东财 datacenter-web（RPTA_WEB_MARGIN_DAILYTRADE）
+//   - 两市成交额 /api/market-turnover：东财 push2 指数实时行情（ulist.np）
 //
 // 注意：本仓库是"代码老家"；真正被各看板调用的是「部署后的 Worker 网址」，不是 GitHub 仓库本身。
 
@@ -307,6 +312,132 @@ async function fetchResearch(code, pages, qType, industry) {
   return all;
 }
 
+// ══ 第二批：为国内看板补充的 A股端点 ════════════════════════════
+const num = (v) => (v == null || v === "" ? null : (typeof v === "number" ? v : parseFloat(v)));
+const DC_URL = "https://datacenter.eastmoney.com/api/data/get";
+const DC_WEB_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get";
+
+// ── 基金净值历史：东财 pingzhongdata（Data_netWorthTrend）────────
+async function fetchFundNav(code, start, end) {
+  const url = `https://fund.eastmoney.com/pingzhongdata/${encodeURIComponent(code)}.js`;
+  const res = await gfetch(url, { "User-Agent": "Mozilla/5.0", "Referer": "https://fund.eastmoney.com/" }, 25000);
+  if (!res.ok) throw new Error("fund HTTP " + res.status);
+  const text = await res.text();
+  const extract = (varName) => {
+    const i = text.indexOf(varName);
+    if (i < 0) return [];
+    const a = text.indexOf("[", i);
+    if (a < 0) return [];
+    const b = text.indexOf("];", a);
+    if (b < 0) return [];
+    try { return JSON.parse(text.slice(a, b + 1)); } catch (e) { return []; }
+  };
+  const navArr = extract("Data_netWorthTrend");   // [{x:ms, y:nav, equityReturn}]
+  const accArr = extract("Data_ACWorthTrend");    // [[ms, accNav], ...]
+  const accMap = {};
+  for (const it of accArr) if (Array.isArray(it)) accMap[it[0]] = it[1];
+  const out = [];
+  for (const it of navArr) {
+    if (it.x == null) continue;
+    // x 为北京零点时间戳（UTC-16:00），+8h 后取日期才能与 akshare/交易日历对齐
+    const d = new Date(it.x + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    if (start && d < start) continue;
+    if (end && d > end) continue;
+    out.push({ date: d, nav: num(it.y), acc_nav: accMap[it.x] != null ? num(accMap[it.x]) : null, equity_return: num(it.equityReturn) });
+  }
+  out.sort((a, b) => (a.date < b.date ? -1 : 1));
+  return out;
+}
+
+// ── 交易日历：从上证指数 K 线派生（有 K 线即交易日）─────────────
+async function fetchTradeCalendar(start, end) {
+  const rows = await fetchKlineFull("sh000001", "day", start, end);
+  if (!rows) return [];
+  return rows.map((r) => r[0]);
+}
+
+// ── 国债收益率：东财 datacenter（中国 + 可选美国）───────────────
+async function fetchBondYield(start, includeUs, maxPages) {
+  const all = [];
+  for (let p = 1; p <= maxPages; p++) {
+    const params = new URLSearchParams({
+      type: "RPTA_WEB_TREASURYYIELD", sty: "ALL", st: "SOLAR_DATE", sr: "-1",
+      token: "894050c76af8597a853f5b408b759f5d", p: String(p), ps: "500",
+      pageNo: String(p), pageNum: String(p),
+    });
+    const res = await gfetch(`${DC_URL}?${params}`, { "User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com/cjsj/zmgzsyl.html" });
+    if (!res.ok) throw new Error("bond HTTP " + res.status);
+    const j = await res.json();
+    const rows = (j.result && j.result.data) || [];
+    if (!rows.length) break;
+    let oldest = null;
+    for (const r of rows) {
+      const d = (r.SOLAR_DATE || "").slice(0, 10);
+      oldest = d;
+      const row = {
+        date: d,
+        cn_2y: num(r.EMM00588704), cn_5y: num(r.EMM00166462), cn_10y: num(r.EMM00166466),
+        cn_30y: num(r.EMM00166469), cn_10y_2y: num(r.EMM01276014), cn_gdp_yoy: num(r.EMM00000024),
+      };
+      if (includeUs) {
+        row.us_2y = num(r.EMG00001306); row.us_5y = num(r.EMG00001308);
+        row.us_10y = num(r.EMG00001310); row.us_30y = num(r.EMG00001312);
+        row.us_10y_2y = num(r.EMG01339436); row.us_gdp_yoy = num(r.EMG00159635);
+      }
+      all.push(row);
+    }
+    if (oldest && oldest <= start) break;
+  }
+  all.sort((a, b) => (a.date < b.date ? -1 : 1));
+  return all;
+}
+
+// ── 两融账户统计：东财 datacenter-web ──────────────────────────
+async function fetchMarginAccount(start, maxPages) {
+  const all = [];
+  for (let p = 1; p <= maxPages; p++) {
+    const params = new URLSearchParams({
+      reportName: "RPTA_WEB_MARGIN_DAILYTRADE", columns: "ALL",
+      pageNumber: String(p), pageSize: "500", sortColumns: "STATISTICS_DATE", sortTypes: "-1",
+      p: String(p), pageNo: String(p), pageNum: String(p),
+    });
+    const res = await gfetch(`${DC_WEB_URL}?${params}`, { "User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com/rzrq/zhtjday.html" });
+    if (!res.ok) throw new Error("margin HTTP " + res.status);
+    const j = await res.json();
+    const rows = (j.result && j.result.data) || [];
+    if (!rows.length) break;
+    let oldest = null;
+    for (const r of rows) {
+      const d = (r.STATISTICS_DATE || "").slice(0, 10);
+      oldest = d;
+      all.push({
+        date: d,
+        fin_balance: num(r.FIN_BALANCE), loan_balance: num(r.LOAN_BALANCE),
+        fin_buy_amt: num(r.FIN_BUY_AMT), loan_sell_amt: num(r.LOAN_SELL_AMT),
+        securities_orgs: num(r.SECURITY_ORG_NUM), business_depts: num(r.OPERATEDEPT_NUM),
+        personal_investors: num(r.PERSONAL_INVESTOR_NUM), org_investors: num(r.ORG_INVESTOR_NUM),
+        active_investors: num(r.INVESTOR_NUM), liable_investors: num(r.MARGINLIAB_INVESTOR_NUM),
+        total_guarantee: num(r.TOTAL_GUARANTEE), avg_guarantee_ratio: num(r.AVG_GUARANTEE_RATIO),
+      });
+    }
+    if (oldest && oldest <= start) break;
+  }
+  all.sort((a, b) => (a.date < b.date ? -1 : 1));
+  return all;
+}
+
+// ── 两市成交额：东财指数实时行情（ulist.np，f6=成交额 元）───────
+async function fetchMarketTurnover(secids) {
+  const url = `https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids=${encodeURIComponent(secids)}&fields=f2,f6,f12,f14&ut=bd1d9ddb04089700cf9c27f6f7426281`;
+  const res = await gfetch(url, { "User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/" });
+  if (!res.ok) throw new Error("turnover HTTP " + res.status);
+  const j = await res.json();
+  const diff = (j.data && j.data.diff) || [];
+  const rows = diff.map((r) => ({ code: r.f12, name: r.f14, price: num(r.f2), amount: num(r.f6) }));
+  const total = rows.reduce((s, r) => s + (r.amount || 0), 0);
+  return { rows, total };
+}
+
 // ── 主路由 ─────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -453,6 +584,102 @@ export default {
       }
     }
 
+    // /api/fund-nav?code=510300&start=&end=
+    if (url.pathname === "/api/fund-nav") {
+      const code = (url.searchParams.get("code") || "510300").replace(/[^0-9]/g, "");
+      const start = url.searchParams.get("start") || "";
+      const end = url.searchParams.get("end") || "";
+      const key = `fundnav:${code}:${start}:${end}`;
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const rows = await fetchFundNav(code, start, end);
+        const payload = { code, count: rows.length, updated: Date.now(), data: rows };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "fund-nav fetch failed", message: String(e.message || e) }, 502);
+      }
+    }
+
+    // /api/trade-calendar?start=2010-01-01&end=2026-12-31
+    if (url.pathname === "/api/trade-calendar") {
+      const start = url.searchParams.get("start") || "2010-01-01";
+      const end = url.searchParams.get("end") || new Date().toISOString().slice(0, 10);
+      const key = `cal:${start}:${end}`;
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const dates = await fetchTradeCalendar(start, end);
+        const payload = { start, end, count: dates.length, updated: Date.now(), data: dates };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "trade-calendar fetch failed", message: String(e.message || e) }, 502);
+      }
+    }
+
+    // /api/bond-yield?start=2015-01-01&include_us=0
+    if (url.pathname === "/api/bond-yield") {
+      const start = url.searchParams.get("start") || "2015-01-01";
+      const includeUs = url.searchParams.get("include_us") === "1";
+      const maxPages = Math.min(Math.max(parseInt(url.searchParams.get("max_pages") || "12", 10) || 12, 1), 40);
+      const key = `bond:${start}:${includeUs ? 1 : 0}:${maxPages}`;
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const rows = await fetchBondYield(start, includeUs, maxPages);
+        const payload = { start, include_us: includeUs, count: rows.length, unit: "收益率 %", updated: Date.now(), data: rows };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "bond-yield fetch failed", message: String(e.message || e) }, 502);
+      }
+    }
+
+    // /api/margin-account?start=2018-01-01
+    if (url.pathname === "/api/margin-account") {
+      const start = url.searchParams.get("start") || "2018-01-01";
+      const maxPages = Math.min(Math.max(parseInt(url.searchParams.get("max_pages") || "10", 10) || 10, 1), 30);
+      const key = `margin:${start}:${maxPages}`;
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const rows = await fetchMarginAccount(start, maxPages);
+        const payload = { start, count: rows.length, updated: Date.now(), data: rows };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "margin-account fetch failed", message: String(e.message || e) }, 502);
+      }
+    }
+
+    // /api/market-turnover?secids=1.000001,0.399001
+    if (url.pathname === "/api/market-turnover") {
+      const secids = url.searchParams.get("secids") || "1.000001,0.399001";
+      const key = `turnover:${secids}`;
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const { rows, total } = await fetchMarketTurnover(secids);
+        const payload = { secids, count: rows.length, total_amount: total, unit: "amount = 元", updated: Date.now(), data: rows };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 300 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "market-turnover fetch failed", message: String(e.message || e) }, 502);
+      }
+    }
+
     return json({
       service: "a-stock-api",
       source: "腾讯财经 + 中证指数官网（改编自 simonlin1212/a-stock-data, Apache-2.0）",
@@ -462,6 +689,11 @@ export default {
         "etf-shares": "/api/etf-shares?exchange=SZ  (exchange=SH|SZ|ALL, date=上交所历史日, code=可选过滤)",
         "fund-flow": "/api/fund-flow?code=510300&days=60  (code 支持 6位/前缀/带市场)",
         research: "/api/research?code=600519&pages=3  (qType=1 行业研报，industry=行业码)",
+        "fund-nav": "/api/fund-nav?code=510300  (基金/ETF 净值历史)",
+        "trade-calendar": "/api/trade-calendar?start=2010-01-01  (交易日历，派生自上证指数K线)",
+        "bond-yield": "/api/bond-yield?start=2015-01-01&include_us=0  (国债收益率 %)",
+        "margin-account": "/api/margin-account?start=2018-01-01  (两融账户统计)",
+        "market-turnover": "/api/market-turnover?secids=1.000001,0.399001  (两市成交额 元)",
       },
       examples: {
         "创业板指": "sz399006",
