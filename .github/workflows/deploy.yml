@@ -19,3 +19,53 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # 部署成功不等于端点可用：上游可能是「只有 Cloudflare 出口才被 WAF 拦」的那种
+      # （push2.eastmoney.com 就是），本地怎么测都通，线上必 502。
+      # 所以每次部署后真刀真枪打一次线上端点，结果写进 Summary。
+      # 不 fail 整个流程：单点失败不该让「部署」变红，但要留痕可查。
+      - name: Smoke test（部署后自检）
+        if: success()
+        continue-on-error: true
+        run: |
+          BASE="https://a-stock-api.wj4020410.workers.dev"
+          SUMMARY="$GITHUB_STEP_SUMMARY"
+          fail=0
+          echo "| 端点 | 结果 | 记录数 | 耗时 |" >> "$SUMMARY"
+          echo "| --- | --- | --- | --- |" >> "$SUMMARY"
+
+          check() {
+            name="$1"; path="$2"; expect="$3"
+            t0=$(date +%s)
+            body=$(curl -sS --max-time 45 "$BASE$path" 2>/dev/null || true)
+            t1=$(date +%s)
+            if printf '%s' "$body" | grep -q -- "$expect"; then
+              mark="PASS"
+            else
+              mark="FAIL"
+              fail=$((fail+1))
+              echo "::warning::smoke test FAIL: $name ($path)"
+              echo "--- $name body(head) ---"
+              printf '%s' "$body" | head -c 300
+              echo ""
+            fi
+            cnt=$(printf '%s' "$body" | jq -r 'if type=="object" then (.count // .total // "n/a") else "n/a" end' 2>/dev/null || echo "n/a")
+            echo "| \`$name\` | $mark | $cnt | $((t1 - t0))s |" >> "$SUMMARY"
+            echo "[$mark] $name  count=$cnt  $((t1 - t0))s"
+          }
+
+          check "help"            "/"                                                   "a-stock-api"
+          check "etf-shares"      "/api/etf-shares?exchange=SH&date=$(date -d '-3 day' +%F)" '"unit":"shares_10k = 万份"'
+          check "index-valuation" "/api/index-valuation?codes=SH000300,SZ399006"        '"pe":'
+          check "cn-liquidity"    "/api/cn-liquidity?days=10"                           '"dr007":'
+          check "etf-premium"     "/api/etf-premium?codes=510300,159919"                '"premium_pct":'
+          check "market-breadth"  "/api/market-breadth"                                 '"total":'
+          check "market-turnover" "/api/market-turnover"                                '"total_amount":'
+
+          echo "" >> "$SUMMARY"
+          if [ "$fail" -eq 0 ]; then
+            echo "全部 7 个端点通过。" >> "$SUMMARY"
+          else
+            echo "**$fail 个端点失败**（详见上方日志的 \`--- body(head) ---\`）。" >> "$SUMMARY"
+          fi
+          exit 0
