@@ -461,6 +461,399 @@ async function fetchMarketTurnover(symbols) {
   return { rows, total };
 }
 
+// ═══ 2026-11 扩充：估值 / 境内资金面 / 折溢价 / 市场宽度 ═════════════
+// 四个新端点的共同约定（与既有端点保持一致，下游据此写容错）：
+//   1) 上游失败不返回「200 + 空数组」，而是带 upstream_error 字段说明原因；
+//   2) 单位写进响应体（unit 字段），不靠文档口头约定；
+//   3) 全失败不写 KV 缓存，避免把一次抖动放大成一小时的空表；
+//   4) 时间戳一律换算成北京时间日期字符串，不把裸 unix 毫秒丢给下游。
+
+// KV 免费额度是 1000 次「写不同键」/天且全账号共享；etf-shares 回填 250 天就是 250 次写。
+// 但历史日期的份额抓过一次永不变化，给它写 1 小时 TTL 的便签纯属烧配额。
+// 规则：只有最近 CACHE_FRESH_DAYS 个自然日内的日期才回写缓存。
+const CACHE_FRESH_DAYS = 5;
+function shouldCacheDate(dateStr) {
+  const m = String(dateStr || "").match(/^(\d{4})-?(\d{2})-?(\d{2})$/);
+  if (!m) return true;
+  const t = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+  return (Date.now() - t) / 86400000 <= CACHE_FRESH_DAYS;
+}
+
+// 带 body 的 POST 版 gfetch（中国货币网两个接口都是 form-urlencoded POST）
+async function gpost(url, headers, body, ms = 20000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { method: "POST", headers, body, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 「北京 00:00 对应的 UTC 毫秒」→ YYYY-MM-DD。
+// 东财 pingzhongdata 的 x、蛋卷的 ts 都是这种口径，直接 toISOString 会整体早一天。
+function bjDate(ts) {
+  const n = Number(ts);
+  if (!n) return "";
+  return new Date(n + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+// 北京「今天」的 YYYY-MM-DD（Worker 跑在 UTC，不能直接 toISOString）
+function bjToday() {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+// 简易并发闸门：避免一次打 8 个 pingzhongdata（每个 500KB）把上游惹毛
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let cursor = 0;
+  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (cursor < items.length) {
+      const i = cursor++;
+      out[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+// ── 指数估值：蛋卷基金 index_eva（免 Key，含 PE/PB 历史分位）──
+// 这是 legulegu（对被墙/401）与中证官网（估值页已改版、接口 404）的替代源。
+// 字段口径：pe_pct = 0~1，越大越贵；pe_over_history 是它的互补值（1 - pe_pct），
+// 两者互为倒数关系，下游统一只用 pe_pct，避免一个指标两种读法。
+const DJ_EVA_URL = "https://danjuanfunds.com/djapi/index_eva/detail/";
+const DJ_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Referer": "https://danjuanfunds.com/djmodule/value-center",
+  "Accept": "application/json, text/plain, */*",
+};
+
+function djIndexCode(raw) {
+  const s = String(raw || "").trim().toUpperCase();
+  if (/^(SH|SZ|BJ)\d{6}$/.test(s)) return s;
+  const d = s.replace(/[^0-9]/g, "");
+  if (d.length !== 6) return "";
+  if (/^[569]/.test(d)) return "SH" + d;
+  if (/^[48]/.test(d)) return "BJ" + d;
+  return "SZ" + d;
+}
+
+async function fetchIndexValuation(codes) {
+  const rows = [];
+  const errs = [];
+  for (const c of codes) {
+    try {
+      const res = await gfetch(DJ_EVA_URL + c, DJ_HEADERS, 12000);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const j = await res.json();
+      const d = j && j.data;
+      if (!d || d.pe == null) throw new Error("no eva data");
+      rows.push({
+        code: c,
+        index_code: d.index_code || c,
+        name: d.name || "",
+        date: d.ts ? bjDate(d.ts) : "",
+        pe: num(d.pe),
+        pb: num(d.pb),
+        pe_pct: num(d.pe_percentile),
+        pb_pct: num(d.pb_percentile),
+        pe_over_history: num(d.pe_over_history),
+        pb_over_history: num(d.pb_over_history),
+        roe: num(d.roe),
+        dividend_yield: num(d.yeild),
+        peg: num(d.peg),
+        level: d.eva_type || "",
+        level_int: d.eva_type_int == null ? null : Number(d.eva_type_int),
+        upstream_bond_yield: num(d.bond_yeild),
+      });
+    } catch (e) {
+      errs.push(c + " " + String((e && e.message) || e));
+    }
+  }
+  return { rows, errs };
+}
+
+// ── 境内资金面：中国货币网（SHIBOR 八期限 + 银行间回购定盘 FR/FDR）──
+// FDR001/007/014 就是 DR001/DR007/DR014（存款类机构质押式回购定盘利率），
+// DR007 是央行公开市场操作盯的那个价，比 SHIBOR 更能代表银行间真实资金面。
+const CM_SHIBOR_URL = "https://www.chinamoney.com.cn/ags/ms/cm-u-bk-shibor/ShiborHis";
+const CM_FRR_URL = "https://www.chinamoney.com.cn/ags/ms/cm-u-bk-currency/FrrHis";
+const CM_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Referer": "https://www.chinamoney.com.cn/chinese/bkccpr/",
+  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+  "Accept": "application/json, text/javascript, */*; q=0.01",
+  "X-Requested-With": "XMLHttpRequest",
+};
+
+async function cmHistory(url, start, end) {
+  const body = "lang=cn&startDate=" + encodeURIComponent(start) + "&endDate=" + encodeURIComponent(end);
+  const res = await gpost(url, CM_HEADERS, body, 15000);
+  if (!res.ok) throw new Error("chinamoney HTTP " + res.status);
+  const j = await res.json();
+  const rec = j && j.records;
+  if (!Array.isArray(rec)) throw new Error("chinamoney records 非数组");
+  return rec;
+}
+
+function tailAvg(series, field, n) {
+  const vals = series.map((s) => s[field]).filter((v) => typeof v === "number" && isFinite(v));
+  if (!vals.length) return null;
+  const t = vals.slice(-n);
+  return +(t.reduce((a, b) => a + b, 0) / t.length).toFixed(4);
+}
+
+function tailDeltaBp(series, field, n) {
+  const vals = series.map((s) => s[field]).filter((v) => typeof v === "number" && isFinite(v));
+  if (vals.length <= n) return null;
+  return +((vals[vals.length - 1] - vals[vals.length - 1 - n]) * 100).toFixed(1);
+}
+
+async function fetchCnLiquidity(days) {
+  const end = bjToday();
+  const start = new Date(Date.now() + 8 * 3600 * 1000 - (days + 20) * 86400000)
+    .toISOString().slice(0, 10);
+  const errs = [];
+
+  const [shiborRec, frrRec] = await Promise.all([
+    cmHistory(CM_SHIBOR_URL, start, end).catch((e) => { errs.push("shibor " + String(e.message || e)); return []; }),
+    cmHistory(CM_FRR_URL, start, end).catch((e) => { errs.push("frr " + String(e.message || e)); return []; }),
+  ]);
+
+  const map = new Map();
+  for (const r of shiborRec) {
+    const d = r.showDateCN || bjDate(r.showDate);
+    if (!d) continue;
+    map.set(d, {
+      date: d,
+      shibor_on: num(r.ON),
+      shibor_1w: num(r["1W"]),
+      shibor_2w: num(r["2W"]),
+      shibor_1m: num(r["1M"]),
+      shibor_3m: num(r["3M"]),
+      shibor_6m: num(r["6M"]),
+      shibor_9m: num(r["9M"]),
+      shibor_1y: num(r["1Y"]),
+    });
+  }
+  for (const r of frrRec) {
+    const m = r.frValueMap || {};
+    const d = m.date || r.lfiProducDate;
+    if (!d) continue;
+    const row = map.get(d) || { date: d };
+    row.dr001 = num(m.FDR001);
+    row.dr007 = num(m.FDR007);
+    row.dr014 = num(m.FDR014);
+    row.fr001 = num(m.FR001);
+    row.fr007 = num(m.FR007);
+    row.fr014 = num(m.FR014);
+    map.set(d, row);
+  }
+
+  const series = Array.from(map.values()).sort((a, b) => (a.date < b.date ? -1 : 1)).slice(-days);
+  if (!series.length) return { rows: [], errs: errs.concat(["两手数据源均无可用记录"]) };
+
+  const last = series[series.length - 1];
+  const derived = {
+    dr007_ma20: tailAvg(series, "dr007", 20),
+    dr007_chg_5d_bp: tailDeltaBp(series, "dr007", 5),
+    dr007_chg_20d_bp: tailDeltaBp(series, "dr007", 20),
+    shibor_3m_chg_20d_bp: tailDeltaBp(series, "shibor_3m", 20),
+    // 期限利差：3M 减隔夜。走阔通常意味机构在提前备付、资金预期收紧
+    term_spread_3m_on_bp: (last.shibor_3m != null && last.shibor_on != null)
+      ? +((last.shibor_3m - last.shibor_on) * 100).toFixed(1) : null,
+    // DR007 相对 20 日均线的偏离，比绝对值更能反映「今天紧不紧」
+    dr007_vs_ma20_bp: (last.dr007 != null && tailAvg(series, "dr007", 20) != null)
+      ? +((last.dr007 - tailAvg(series, "dr007", 20)) * 100).toFixed(1) : null,
+  };
+
+  return { rows: series, derived, latest: last, errs };
+}
+
+// ── ETF 折溢价：二级市场收盘价（腾讯）vs 单位净值（东财 pingzhongdata）──
+// 不依赖任何「IOPV 实时估值」接口（那类接口全在 push2 上，被 WAF 挡）。
+// 折溢价率 =（市价 − 净值）/ 净值 × 100，日频足够判断申赎情绪。
+// stale 标记：净值是 T 日、价格是 T+1 时（盘中必然如此），折溢价要用「同一时点」才准，
+// 所以让下游能识别并选择是否采用。
+const TX_QUOTE_URL = "https://qt.gtimg.cn/q=";
+const EM_NAV_JS = "https://fund.eastmoney.com/pingzhongdata/";
+
+function txCode(raw) {
+  const d = String(raw || "").replace(/[^0-9]/g, "");
+  if (d.length !== 6) return "";
+  if (/^[569]/.test(d)) return "sh" + d;
+  if (/^[48]/.test(d)) return "bj" + d;
+  return "sz" + d;
+}
+
+async function fetchTxQuotes(codes) {
+  const q = codes.map(txCode).filter(Boolean).join(",");
+  if (!q) throw new Error("无有效代码");
+  const res = await gfetch(TX_QUOTE_URL + encodeURIComponent(q),
+    { "User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/" }, 15000);
+  if (!res.ok) throw new Error("tx HTTP " + res.status);
+  const buf = await res.arrayBuffer();
+  let text;
+  try { text = new TextDecoder("gbk").decode(buf); } catch (e) { text = new TextDecoder("utf-8").decode(buf); }
+  const map = new Map();
+  for (const seg of text.split(";")) {
+    const m = seg.trim().match(/^v_([a-z]{2})(\d{6})="([\s\S]*)"$/);
+    if (!m) continue;
+    const p = m[3].split("~");
+    if (p.length < 38) continue;
+    map.set(m[2], {
+      code: m[2],
+      name: p[1],
+      price: num(p[3]),
+      prev_close: num(p[4]),
+      time: p[30] || "",
+      amount: num(String(p[35] || "").split("/")[2]),
+    });
+  }
+  return map;
+}
+
+async function fetchLatestNav(code) {
+  const res = await gfetch(EM_NAV_JS + code + ".js",
+    { "User-Agent": "Mozilla/5.0", "Referer": "https://fund.eastmoney.com/" }, 25000);
+  if (!res.ok) throw new Error("nav HTTP " + res.status);
+  const text = await res.text();
+  const m = text.match(/Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);/);
+  if (!m) throw new Error("未找到 Data_netWorthTrend");
+  const arr = JSON.parse(m[1]);
+  if (!arr.length) throw new Error("净值为空");
+  const last = arr[arr.length - 1];
+  return { nav: num(last.y), date: bjDate(last.x) };
+}
+
+async function fetchEtfPremium(codes) {
+  const errs = [];
+  const digits = codes.map((c) => String(c).replace(/[^0-9]/g, "")).filter((d) => d.length === 6);
+  if (!digits.length) return { rows: [], errs: ["无有效 6 位代码"] };
+
+  let quotes = new Map();
+  try {
+    quotes = await fetchTxQuotes(digits);
+  } catch (e) {
+    errs.push("quote " + String(e.message || e));
+  }
+
+  const rows = [];
+  await mapLimit(digits, 4, async (code) => {
+    let navInfo = null;
+    try {
+      navInfo = await fetchLatestNav(code);
+    } catch (e) {
+      errs.push(code + " nav " + String(e.message || e));
+    }
+    const q = quotes.get(code);
+    if (!q || q.price == null) { errs.push(code + " 无行情"); return; }
+    const priceDate = q.time && q.time.length >= 8
+      ? q.time.slice(0, 4) + "-" + q.time.slice(4, 6) + "-" + q.time.slice(6, 8) : "";
+    let premium = null;
+    if (navInfo && navInfo.nav) premium = +(((q.price - navInfo.nav) / navInfo.nav) * 100).toFixed(4);
+    rows.push({
+      code,
+      name: q.name || "",
+      price: q.price,
+      nav: navInfo ? navInfo.nav : null,
+      price_date: priceDate,
+      nav_date: navInfo ? navInfo.date : "",
+      premium_pct: premium,
+      stale: !!(priceDate && navInfo && navInfo.date && priceDate !== navInfo.date),
+    });
+  });
+
+  rows.sort((a, b) => (a.code < b.code ? -1 : 1));
+  return { rows, errs };
+}
+
+// ── 市场宽度：东财 push2ex（涨跌分布 / 涨停池 / 跌停池）──
+// 全部集中在 push2ex.eastmoney.com 一个域名，与已知被 WAF 拦的 push2.eastmoney.com 不同。
+// 重要限制：这三个接口**忽略 date 参数，永远返回当天**（实测传 20261103 仍回 qdate=20261104），
+// 所以只能每天抓一次当日快照自行累积历史，无法回填。
+// 口径说明：涨跌家数由「涨跌幅分布直方图」求和得出（与 push2 的 f104/f105/f106 交叉校验过，
+// 差异在 1.5% 以内，源于是否含北交所与停牌股）；涨停/跌停家数取池子的 tc 字段。
+const P2EX_URL = "https://push2ex.eastmoney.com";
+const P2EX_UT = "7eea3edcaed734bea9cbfc24409ed989";
+const P2EX_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Referer": "https://quote.eastmoney.com/ztb/detail",
+  "Accept": "*/*",
+};
+
+async function p2exGet(path) {
+  const res = await gfetch(P2EX_URL + path, P2EX_HEADERS, 12000);
+  if (!res.ok) throw new Error("push2ex HTTP " + res.status);
+  const j = await res.json();
+  return j && j.data;
+}
+
+async function fetchMarketBreadth() {
+  const today = bjToday().replace(/-/g, "");
+  const errs = [];
+  const settle = await Promise.allSettled([
+    p2exGet("/getTopicZDFenBu?ut=" + P2EX_UT + "&dpt=wz.ztzt&date=" + today),
+    p2exGet("/getTopicZTPool?ut=" + P2EX_UT + "&dpt=wz.ztzt&Pageindex=0&pagesize=300&sort=fbt%3Aasc&date=" + today),
+    p2exGet("/getTopicDTPool?ut=" + P2EX_UT + "&dpt=wz.ztzt&Pageindex=0&pagesize=300&sort=fund%3Aasc&date=" + today),
+  ]);
+  const val = (i, label) => {
+    const r = settle[i];
+    if (r.status === "fulfilled" && r.value) return r.value;
+    errs.push(label + " " + String((r.reason && r.reason.message) || "empty"));
+    return null;
+  };
+  const dist = val(0, "zdfenbu");
+  const zt = val(1, "ztpool");
+  const dt = val(2, "dtpool");
+
+  let up = 0, down = 0, flat = 0;
+  const fenbu = (dist && dist.fenbu) || [];
+  for (const item of fenbu) {
+    for (const k of Object.keys(item)) {
+      const bucket = Number(k);
+      const n = Number(item[k]) || 0;
+      if (bucket > 0) up += n;
+      else if (bucket < 0) down += n;
+      else flat += n;
+    }
+  }
+  const total = up + down + flat;
+
+  const streakDist = {};
+  let maxStreak = 0;
+  for (const p of (zt && zt.pool) || []) {
+    const n = Number(p.lbc) || 0;
+    if (n > 0) {
+      streakDist[n] = (streakDist[n] || 0) + 1;
+      if (n > maxStreak) maxStreak = n;
+    }
+  }
+
+  const qdate = (dist && dist.qdate) || (zt && zt.qdate) || null;
+  const dateStr = qdate ? String(qdate).replace(/^(\d{4})(\d{2})(\d{2})$/, "$1-$2-$3") : "";
+
+  return {
+    date: dateStr,
+    is_today: dateStr === bjToday(),
+    history_supported: false,
+    up,
+    down,
+    flat,
+    total,
+    up_pct: total ? +((up / total) * 100).toFixed(1) : null,
+    limit_up: zt && zt.tc != null ? Number(zt.tc) : null,
+    limit_down: dt && dt.tc != null ? Number(dt.tc) : null,
+    max_streak: maxStreak,
+    streak_dist: streakDist,
+    dist: fenbu,
+    errs,
+  };
+}
+
 // ── 主路由 ─────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -566,7 +959,9 @@ export default {
       // 结果是一整段时间里反复拿到同一份空表（2026-11-04 就是这样静默丢了 5 天）。
       // 同时把空表的原因显式回给调用方，别让它看起来像「确实没有数据」。
       if (combined.length === 0 && shErr) payload.upstream_error = shErr;
-      if (combined.length > 0) {
+      // 只缓存「最近 5 个自然日」：历史日期抓一次永不变化，写它只是烧 KV 的
+      // 1000 次/天写配额（250 天回填 = 250 个键）。旧行为是 250 次全写。
+      if (combined.length > 0 && shouldCacheDate(date)) {
         ctx.waitUntil(
           env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {})
         );
@@ -730,6 +1125,119 @@ export default {
       }
     }
 
+    // /api/index-valuation?codes=SH000300,SZ399006  (也接受 sh000300 / 000300)
+    if (url.pathname === "/api/index-valuation") {
+      const raw = url.searchParams.get("codes") || url.searchParams.get("code") || "SH000300,SZ399006";
+      const codes = raw.split(",").map(djIndexCode).filter(Boolean);
+      if (!codes.length) return json({ error: "bad_request", message: "codes 无法解析成指数代码" }, 400);
+      const key = "idxval:" + codes.join(",");
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      const { rows, errs } = await fetchIndexValuation(codes);
+      const payload = {
+        count: rows.length,
+        unit: { pe_pct: "0~1, 越大越贵", roe: "小数(0.0993=9.93%)", dividend_yield: "小数", peg: "倍" },
+        note: "pe_pct 即上游 pe_percentile；pe_over_history 是其互补值(1-pe_pct)，仅透传备查，勿混用。"
+          + "upstream_bond_yield 口径不明（常数级），不要拿去算股债性价比。",
+        updated: Date.now(),
+        data: rows,
+      };
+      if (errs.length) payload.upstream_error = errs.join(" | ");
+      if (rows.length > 0) {
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+      }
+      return json(payload);
+    }
+
+    // /api/cn-liquidity?days=60  (SHIBOR 八期限 + FR/FDR 回购定盘，单位 %)
+    if (url.pathname === "/api/cn-liquidity") {
+      const days = Math.max(5, Math.min(250, parseInt(url.searchParams.get("days") || "60", 10) || 60));
+      const key = "cnliq:" + days;
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      const r = await fetchCnLiquidity(days);
+      const payload = {
+        count: r.rows.length,
+        unit: "% (年化)",
+        fields: {
+          dr001: "DR001 存款类机构质押式回购定盘利率(隔夜)",
+          dr007: "DR007 存款类机构质押式回购定盘利率(7天)，央行公开市场操作锚",
+          dr014: "DR014",
+          fr001: "FR001 银行间质押式回购定盘利率(隔夜)",
+          fr007: "FR007",
+          fr014: "FR014",
+          shibor_on: "SHIBOR 隔夜",
+          shibor_1w: "SHIBOR 1周",
+          shibor_1m: "SHIBOR 1月",
+          shibor_3m: "SHIBOR 3月（中期资金成本）",
+          shibor_1y: "SHIBOR 1年",
+        },
+        derived_unit: "bp（1bp = 0.01 个百分点）",
+        updated: Date.now(),
+        latest: r.latest || null,
+        derived: r.derived || null,
+        data: r.rows,
+      };
+      if (r.errs && r.errs.length) payload.upstream_error = r.errs.join(" | ");
+      if (r.rows.length > 0) {
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 1800 }).catch(() => {}));
+      }
+      return json(payload);
+    }
+
+    // /api/etf-premium?codes=510300,159919  (折溢价率 %，附 stale 标记)
+    if (url.pathname === "/api/etf-premium") {
+      const raw = url.searchParams.get("codes") || url.searchParams.get("code") || "510300,159919";
+      const codes = raw.split(",").map((t) => t.trim()).filter(Boolean).slice(0, 30);
+      if (!codes.length) return json({ error: "bad_request", message: "codes 为空" }, 400);
+      const key = "premium:" + codes.map((c) => c.replace(/[^0-9]/g, "")).join(",");
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      const { rows, errs } = await fetchEtfPremium(codes);
+      const payload = {
+        count: rows.length,
+        unit: "premium_pct = %；price = 元；nav = 元",
+        note: "折溢价 = (市价 − 净值) / 净值 × 100。stale=true 表示价格日期与净值日期不同"
+          + "（盘中必然如此），此时该值只反映「相对昨日净值的偏离」，不要当收盘折溢价用。",
+        updated: Date.now(),
+        data: rows,
+      };
+      if (errs.length) payload.upstream_error = errs.join(" | ");
+      if (rows.length > 0) {
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 600 }).catch(() => {}));
+      }
+      return json(payload);
+    }
+
+    // /api/market-breadth  (涨跌家数 / 涨停跌停 / 连板高度，仅当日，不支持历史)
+    if (url.pathname === "/api/market-breadth") {
+      const key = "breadth:today";
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      const r = await fetchMarketBreadth();
+      const payload = {
+        unit: "counts（家）",
+        note: "涨跌家数由涨跌幅分布直方图求和；涨停/跌停取池子 tc；max_streak 为最高连板高度。"
+          + "上游三个接口忽略 date 参数、永远返回当日快照，因此 history_supported=false，无法回填历史。",
+        updated: Date.now(),
+        ...r,
+      };
+      if (r.errs && r.errs.length) payload.upstream_error = r.errs.join(" | ");
+      // 盘中数据每分钟都在变，只给 5 分钟；且只有拿到有效分布才缓存
+      if (r.total > 0) {
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 300 }).catch(() => {}));
+      }
+      return json(payload);
+    }
+
     return json({
       service: "a-stock-api",
       source: "腾讯财经 + 中证指数官网（改编自 simonlin1212/a-stock-data, Apache-2.0）",
@@ -744,6 +1252,10 @@ export default {
         "bond-yield": "/api/bond-yield?start=2015-01-01&include_us=0  (国债收益率 %)",
         "margin-account": "/api/margin-account?start=2018-01-01  (两融账户统计)",
         "market-turnover": "/api/market-turnover?symbols=sh000001,sz399001  (两市成交额 元)",
+        "index-valuation": "/api/index-valuation?codes=SH000300,SZ399006  (PE/PB 及历史分位, 0~1)",
+        "cn-liquidity": "/api/cn-liquidity?days=60  (SHIBOR 八期限 + DR001/DR007/DR014，单位 %)",
+        "etf-premium": "/api/etf-premium?codes=510300,159919  (折溢价率 %，附 stale 标记)",
+        "market-breadth": "/api/market-breadth  (涨跌家数/涨停跌停/连板高度，仅当日)",
       },
       examples: {
         "创业板指": "sz399006",
