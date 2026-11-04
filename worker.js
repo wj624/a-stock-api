@@ -16,6 +16,10 @@
 //   - ETF 折溢价 /api/etf-premium：腾讯行情价 vs 东财 pingzhongdata 净值（自算，不依赖 IOPV）
 //   - 市场宽度 /api/market-breadth：东财 push2ex（涨跌分布 + 涨停池 + 跌停池，仅当日快照）
 //   - 国债曲线 /api/cn-rates：东财 datacenter 的尾部窗口切片（/api/bond-yield 的轻量版）
+//   - 商品实时 /api/commodity-quote：新浪 hq.sinajs.cn（沪金/沪银/SC原油 + 纽约金银/WTI/布伦特）
+//   - 期货日K /api/futures-kline：新浪 InnerFuturesNewService（主力连续，2005/2008 起）
+//   - 上金所现货 /api/sge-spot：sge.com.cn/graph/Dailyhq（Au99.99 / Ag(T+D)，2016-12 起）
+//   - 全球指数 /api/global-index：新浪 znb_（KOSPI / 恒生 / 富时100，仅实时）
 //
 // 注意：本仓库是"代码老家"；真正被各看板调用的是「部署后的 Worker 网址」，不是 GitHub 仓库本身。
 
@@ -905,6 +909,180 @@ async function fetchMarketBreadth() {
   };
 }
 
+// ── 商品 / 贵金属 / 原油 / 全球指数（新浪 hq.sinajs.cn + 上金所）────────
+// 接口改编自 simonlin1212/a-stock-data Layer 13（Apache-2.0）；外盘 hf_ 与
+// 全球指数 znb_ 为该项目的 _sina_hq() 通用 helper 的直接延伸（文档未列这两个前缀）。
+const SINA_HQ_URL = "https://hq.sinajs.cn/list=";
+const SINA_FUT_KLINE_URL = "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/"
+  + "var%20_{code}=/InnerFuturesNewService.getDailyKLine";
+const SGE_DAILY_URL = "https://www.sge.com.cn/graph/Dailyhq";
+const SINA_HDR = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Referer": "https://finance.sina.com.cn/",
+  "Accept": "*/*",
+};
+
+// 国内用 nf_ 前缀（六家期货交易所），外盘用 hf_ 前缀；全部主力连续 / 连续合约
+const COMMODITY_DEFS = {
+  AU0:  { market: "CN",   name: "沪金主力连续",     unit: "元/克",    venue: "上期所 SHFE" },
+  AG0:  { market: "CN",   name: "沪银主力连续",     unit: "元/千克",  venue: "上期所 SHFE" },
+  SC0:  { market: "CN",   name: "上海原油主力连续", unit: "元/桶",    venue: "上期能源 INE" },
+  GC:   { market: "INTL", name: "纽约黄金 COMEX",   unit: "美元/盎司", venue: "COMEX" },
+  SI:   { market: "INTL", name: "纽约白银 COMEX",   unit: "美元/盎司", venue: "COMEX" },
+  CL:   { market: "INTL", name: "WTI 纽约原油",     unit: "美元/桶",   venue: "NYMEX" },
+  OIL:  { market: "INTL", name: "布伦特原油",       unit: "美元/桶",   venue: "ICE" },
+};
+const DEFAULT_COMMODITIES = Object.keys(COMMODITY_DEFS);
+
+// znb_ 全球指数：实测 KOSPI / HSI / FTSE 有值，DJI / IXIC / N225 返回空串，故不列入
+const GLOBAL_DEFS = {
+  KOSPI: { name: "韩国 KOSPI (KRX:KOSPI)", region: "KR" },
+  HSI:   { name: "香港恒生指数",           region: "HK" },
+  FTSE:  { name: "富时100",                region: "UK" },
+};
+
+function cnum(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+// hq.sinajs.cn 返回 GB18030。Workers 的 TextDecoder 支持 gbk；万一运行时不支持，
+// 退回 utf-8 只会把中文变成替换字符，逗号分隔的数字字段不受影响，解析照样成立。
+async function gbkText(res) {
+  const buf = await res.arrayBuffer();
+  try { return new TextDecoder("gbk").decode(buf); }
+  catch (_) { return new TextDecoder("utf-8").decode(buf); }
+}
+
+function parseHqVars(text) {
+  const out = {};
+  const re = /var hq_str_([^=]+)="([^"]*)"/g;
+  let m;
+  while ((m = re.exec(text)) !== null) out[m[1]] = m[2] ? m[2].split(",") : [];
+  return out;
+}
+
+async function sinaHq(keys) {
+  const res = await gfetch(SINA_HQ_URL + keys.join(","), SINA_HDR, 12000);
+  if (!res.ok) throw new Error("hq.sinajs.cn HTTP " + res.status);
+  return parseHqVars(await gbkText(res));
+}
+
+async function fetchCommodityQuotes(symbols) {
+  const keys = symbols.map((s) =>
+    (COMMODITY_DEFS[s].market === "CN" ? "nf_" : "hf_") + s);
+  const hq = await sinaHq(keys);
+  const rows = [], errs = [];
+  for (const s of symbols) {
+    const def = COMMODITY_DEFS[s];
+    const f = hq[(def.market === "CN" ? "nf_" : "hf_") + s];
+    if (!f || !f.length) { errs.push(s + ": 上游返回空（代码不存在或已摘牌）"); continue; }
+    if (def.market === "CN") {
+      if (f.length < 18) { errs.push(s + ": 字段数只有 " + f.length); continue; }
+      const clock = String(f[1] || "").padStart(6, "0");
+      rows.push({
+        symbol: s, ...def, upstream_name: f[0] || null,
+        last: cnum(f[8]), open: cnum(f[2]), high: cnum(f[3]), low: cnum(f[4]),
+        bid: cnum(f[6]), ask: cnum(f[7]), bid_vol: cnum(f[11]), ask_vol: cnum(f[12]),
+        volume: cnum(f[14]), open_interest: cnum(f[13]),
+        pre_settle: cnum(f[10]), avg_price: cnum(f[27]),
+        date: f[17] || null,
+        time: clock.length === 6
+          ? clock.slice(0, 2) + ":" + clock.slice(2, 4) + ":" + clock.slice(4, 6) : null,
+      });
+    } else {
+      if (f.length < 14) { errs.push(s + ": 字段数只有 " + f.length); continue; }
+      rows.push({
+        symbol: s, ...def, upstream_name: f[13] || null,
+        last: cnum(f[0]), open: cnum(f[8]), high: cnum(f[4]), low: cnum(f[5]),
+        bid: cnum(f[2]), ask: cnum(f[3]), pre_settle: cnum(f[7]),
+        date: f[12] || null, time: f[6] || null,
+      });
+    }
+  }
+  return { rows, errs };
+}
+
+async function fetchFuturesKline(symbol) {
+  const u = SINA_FUT_KLINE_URL.replace("{code}", symbol)
+    + "?symbol=" + encodeURIComponent(symbol);
+  const res = await gfetch(u, SINA_HDR, 20000);
+  if (!res.ok) throw new Error("sina futures kline HTTP " + res.status);
+  const text = await gbkText(res);
+  // 返回形如 /*<script>...*/ var _AU0=([{...}]);  —— 只取 var 之后的括号内容
+  const p = text.indexOf("var _");
+  if (p < 0) throw new Error("新浪期货日K 返回不是预期的 JSONP");
+  const seg = text.slice(p);
+  const op = seg.indexOf("("), cp = seg.lastIndexOf(")");
+  if (op < 0 || cp <= op) throw new Error("新浪期货日K JSONP 括号缺失");
+  const body = seg.slice(op + 1, cp).trim();
+  if (body === "null") throw new Error("无此合约日K（代码不存在或合约过老）");
+  let items;
+  try { items = JSON.parse(body); } catch (e) { throw new Error("新浪期货日K 不是合法 JSON"); }
+  if (!Array.isArray(items)) throw new Error("新浪期货日K 返回不是数组");
+  const rows = items.map((r) => ({
+    date: String(r.d || ""), open: cnum(r.o), high: cnum(r.h), low: cnum(r.l),
+    close: cnum(r.c), settle: cnum(r.s) || null,   // 新浪缺结算价时给 0
+    volume: cnum(r.v), open_interest: cnum(r.p),
+  })).filter((r) => r.date && r.close != null);
+  rows.sort((a, b) => a.date < b.date ? -1 : (a.date > b.date ? 1 : 0));
+  if (!rows.length) throw new Error("区间内无有效日K");
+  return rows;
+}
+
+async function postForm(url, headers, body, ms = 15000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { method: "POST", headers, body, signal: ctrl.signal });
+  } finally { clearTimeout(timer); }
+}
+
+async function fetchSgeSpot(instrument) {
+  const res = await postForm(SGE_DAILY_URL, {
+    "User-Agent": SINA_HDR["User-Agent"],
+    "Referer": "https://www.sge.com.cn/",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Accept": "*/*",
+  }, "instid=" + encodeURIComponent(instrument));
+  if (!res.ok) throw new Error("上金所 HTTP " + res.status);
+  const j = await res.json();
+  if (!j || !Array.isArray(j.time)) throw new Error("上金所日线返回结构改变");
+  // 每条 [date, open, close, low, high]；无成交日交易所填 0，剔除
+  const rows = [];
+  for (const rec of j.time) {
+    if (!Array.isArray(rec) || rec.length < 5) continue;
+    const o = cnum(rec[1]), c = cnum(rec[2]), l = cnum(rec[3]), h = cnum(rec[4]);
+    if (!o || !c || !l || !h) continue;
+    rows.push({ date: String(rec[0]), open: o, close: c, low: l, high: h });
+  }
+  rows.sort((a, b) => a.date < b.date ? -1 : (a.date > b.date ? 1 : 0));
+  if (!rows.length) throw new Error("上金所没有 " + instrument + " 的有效行情（代码不存在时返回全 0）");
+  return rows;
+}
+
+async function fetchGlobalIndex(symbols) {
+  const hq = await sinaHq(symbols.map((s) => "znb_" + s));
+  const rows = [], errs = [];
+  for (const s of symbols) {
+    const f = hq["znb_" + s];
+    if (!f || !f.length) { errs.push(s + ": 新浪该指数返回空"); continue; }
+    rows.push({
+      symbol: s, ...GLOBAL_DEFS[s], upstream_name: f[0] || null,
+      last: cnum(f[1]), change: cnum(f[2]), change_pct: cnum(f[3]),
+      date: f[6] || null, time: f[7] || null,
+      open: cnum(f[8]), pre_close: cnum(f[9]),
+      high: cnum(f[10]), low: cnum(f[11]),
+    });
+  }
+  return { rows, errs };
+}
+
+
 // ── 主路由 ─────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -1320,6 +1498,129 @@ export default {
       return json(payload);
     }
 
+    // /api/commodity-quote?symbols=AU0,AG0,SC0,GC,SI,CL,OIL
+    // 国内沪金/沪银/SC原油主力连续 + 纽约黄金白银/WTI/布伦特，一次请求全部拿到。
+    if (url.pathname === "/api/commodity-quote") {
+      const raw = url.searchParams.get("symbols") || DEFAULT_COMMODITIES.join(",");
+      const symbols = raw.split(",").map((s) => s.trim().toUpperCase()
+        .replace(/^NF_/, "").replace(/^HF_/, "")).filter((s) => COMMODITY_DEFS[s]);
+      if (!symbols.length) return json({ error: "bad_request", message: "symbols 无有效代码", supported: DEFAULT_COMMODITIES }, 400);
+      const key = "commodity:" + symbols.join(",");
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const { rows, errs } = await fetchCommodityQuotes(symbols);
+        if (!rows.length) return json({ error: "upstream_empty", errs, symbols }, 502);
+        const payload = {
+          symbols, count: rows.length, updated: Date.now(),
+          note: "国内 nf_ 主力连续（元/克、元/千克、元/桶）；外盘 hf_ 连续合约（美元计价）。"
+            + "盘中为实时价，收盘后为当日快照；国内结算价以上期所官方为准。",
+          data: rows,
+        };
+        if (errs.length) payload.upstream_error = errs.join(" | ");
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 300 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "commodity-quote fetch failed", message: String(e.message || e) }, 502);
+      }
+    }
+
+    // /api/futures-kline?symbol=AU0&days=250  (主力连续日K；也可 AG0 / SC0 / RB0 / M0)
+    if (url.pathname === "/api/futures-kline") {
+      const symbol = (url.searchParams.get("symbol") || "AU0").toUpperCase()
+        .replace(/^NF_/, "");
+      if (!/^[A-Z]{1,2}\d{1,4}$/.test(symbol)) {
+        return json({ error: "bad_request", message: "symbol 格式应为 AU0 / AG0 / SC0 / RB2601" }, 400);
+      }
+      const days = Math.max(1, Math.min(6000, parseInt(url.searchParams.get("days") || "250", 10) || 250));
+      const start = normDate(url.searchParams.get("start")) || null;
+      const end = normDate(url.searchParams.get("end")) || null;
+      const key = "futk:" + symbol + ":" + days + ":" + (start || "") + ":" + (end || "");
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        let rows = await fetchFuturesKline(symbol);
+        if (start) rows = rows.filter((r) => r.date >= start);
+        if (end) rows = rows.filter((r) => r.date <= end);
+        if (rows.length > days) rows = rows.slice(rows.length - days);
+        if (!rows.length) return json({ error: "no_rows_in_range", symbol, start, end }, 404);
+        const payload = {
+          symbol, count: rows.length, unit: "price = 交易所报价单位；settle 为结算价(缺则 null)",
+          note: "新浪 InnerFuturesNewService 主力连续，换月会跳空、未复权；结算价给 0 时置 null。"
+            + "返回的是该代码全历史后本地裁剪，故 start/end/days 不影响上游流量。",
+          updated: Date.now(), data: rows,
+        };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "futures-kline fetch failed", symbol, message: String(e.message || e) }, 502);
+      }
+    }
+
+    // /api/sge-spot?instrument=Au99.99&days=250  (上金所现货：Au99.99 / Au(T+D) / Ag(T+D) / Pt99.95)
+    if (url.pathname === "/api/sge-spot") {
+      const instrument = url.searchParams.get("instrument") || "Au99.99";
+      // days=0 / 不传 = 返回全历史；不能用 Math.max(1,...) 夹，否则「全历史」会被压成最后 1 条
+      const daysRaw = parseInt(url.searchParams.get("days") || "0", 10) || 0;
+      const days = daysRaw > 0 ? Math.min(6000, daysRaw) : 0;
+      const key = "sge:" + instrument + ":" + days;
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        let rows = await fetchSgeSpot(instrument);
+        if (days && rows.length > days) rows = rows.slice(rows.length - days);
+        const payload = {
+          instrument, count: rows.length,
+          unit: /^Ag/i.test(instrument) ? "元/千克" : "元/克",
+          note: "上海黄金交易所现货日线，2016-12 起；无成交日(全 0)已剔除。"
+            + "少数交易日收盘价略超高低区间是原始数据如此。",
+          updated: Date.now(), data: rows,
+        };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "sge-spot fetch failed", instrument, message: String(e.message || e) }, 502);
+      }
+    }
+
+    // /api/global-index?symbols=KOSPI,HSI,FTSE  (KRX:KOSPI 等，仅实时快照)
+    if (url.pathname === "/api/global-index") {
+      const raw = url.searchParams.get("symbols") || "KOSPI";
+      const symbols = raw.split(",").map((s) => s.trim().toUpperCase()
+        .replace(/^ZNB_/, "").replace(/^KRX:/, "")).filter((s) => GLOBAL_DEFS[s]);
+      if (!symbols.length) {
+        return json({ error: "bad_request", message: "symbols 无有效代码", supported: Object.keys(GLOBAL_DEFS) }, 400);
+      }
+      const key = "gidx:" + symbols.join(",");
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const { rows, errs } = await fetchGlobalIndex(symbols);
+        if (!rows.length) return json({ error: "upstream_empty", errs, symbols }, 502);
+        const payload = {
+          symbols, count: rows.length, updated: Date.now(),
+          history_supported: false,
+          note: "新浪 znb_ 全球指数快照。KRX:KOSPI 请传 symbols=KOSPI。"
+            + "实测 DJI / IXIC / N225 该前缀返回空串，故未列入；"
+            + "免费纯 HTTP 源暂无可靠历史日K，本端点只提供实时/收盘快照。",
+          data: rows,
+        };
+        if (errs.length) payload.upstream_error = errs.join(" | ");
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 300 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "global-index fetch failed", message: String(e.message || e) }, 502);
+      }
+    }
+
     return json({
       service: "a-stock-api",
       source: "腾讯财经 + 中证指数官网（改编自 simonlin1212/a-stock-data, Apache-2.0）",
@@ -1339,6 +1640,10 @@ export default {
         "etf-premium": "/api/etf-premium?codes=510300,159919  (折溢价率 %，附 stale 标记)",
         "market-breadth": "/api/market-breadth  (涨跌家数/涨停跌停/连板高度，仅当日)",
         "cn-rates": "/api/cn-rates?days=250  (国债 2/5/10/30Y 曲线 + 期限利差 bp，尾部窗口)",
+        "commodity-quote": "/api/commodity-quote?symbols=AU0,AG0,SC0,GC,SI,CL,OIL  (沪金/沪银/SC原油 + 纽约金银/WTI/布伦特)",
+        "futures-kline": "/api/futures-kline?symbol=AU0&days=250  (期货主力连续日K)",
+        "sge-spot": "/api/sge-spot?instrument=Au99.99&days=250  (上金所黄金/白银现货日线)",
+        "global-index": "/api/global-index?symbols=KOSPI  (KRX:KOSPI 等全球指数实时，无历史)",
       },
       examples: {
         "创业板指": "sz399006",
