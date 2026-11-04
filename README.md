@@ -109,6 +109,62 @@
 
 示例：`/api/research?code=600519&pages=3`、`/api/research?qType=1&industry=1238&pages=5`
 
+### `GET /api/fund-nav` — 基金 / ETF 净值历史
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `code` | 6 位基金代码（如 `510300`） | `510300` |
+| `start` / `end` | 日期过滤 `YYYY-MM-DD`（可空=全部） | 空 |
+
+直连东财 `fund.eastmoney.com/pingzhongdata`，取 `Data_netWorthTrend`。日期已按北京时区对齐（与 akshare `fund_open_fund_info_em` 输出一致）。返回 `{date, nav, acc_nav, equity_return}`。
+
+示例：`/api/fund-nav?code=510300`
+
+### `GET /api/trade-calendar` — 交易日历
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `start` / `end` | 区间 `YYYY-MM-DD` | `2010-01-01` / 今天 |
+
+**不依赖额外上游**：直接从上证指数（`sh000001`）日 K 线派生——有 K 线的日期即交易日。返回升序日期数组。
+
+示例：`/api/trade-calendar?start=2015-01-01`
+
+### `GET /api/bond-yield` — 中国国债收益率（可选含美国）
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `start` | 起始日 `YYYY-MM-DD` | `2015-01-01` |
+| `include_us` | `1` 则附带美国国债列 | `0` |
+| `max_pages` | 翻页上限（每页 500 行） | `12` |
+
+东财 datacenter `RPTA_WEB_TREASURYYIELD`。返回 `{date, cn_2y, cn_5y, cn_10y, cn_30y, cn_10y_2y, cn_gdp_yoy}`（收益率单位 %），`include_us=1` 时再加 `us_2y/us_5y/us_10y/us_30y/us_10y_2y/us_gdp_yoy`。
+
+示例：`/api/bond-yield?start=2018-01-01`
+
+### `GET /api/margin-account` — 两融账户统计
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `start` | 起始日 `YYYY-MM-DD` | `2018-01-01` |
+| `max_pages` | 翻页上限（每页 500 行） | `10` |
+
+东财 datacenter-web `RPTA_WEB_MARGIN_DAILYTRADE`。返回 `{date, fin_balance, loan_balance, fin_buy_amt, loan_sell_amt, securities_orgs, business_depts, personal_investors, org_investors, active_investors, liable_investors, total_guarantee, avg_guarantee_ratio}`（余额约亿元、投资者数量约万户，以上游原值为准）。
+
+示例：`/api/margin-account?start=2020-01-01`
+
+### `GET /api/market-turnover` — 两市成交额
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `secids` | 东财 secid 列表（逗号分隔） | `1.000001,0.399001` |
+
+东财 push2 指数实时行情（`ulist.np`）。返回各指数 `{code, name, price, amount}` 与合计 `total_amount`（成交额单位：元）。默认给的是「上证指数 + 深证成指」，两者之和即两市成交额。
+
+示例：`/api/market-turnover?secids=1.000001,0.399001,0.399006`
+
+> **未提供（及原因）**：`/api/index-valuation`（指数历史 PE/PB）——上游乐咕乐股有阿里云反爬，Worker 无法稳定复刻；`/api/spot`（全市场逐股快照）——东财单页强制 100 条、全市场 5900+ 只需 60 页，超免费 Worker 子请求上限，成交额需求请用 `/api/market-turnover`。
+
 ## 看板里怎么调用
 
 ```js
@@ -131,6 +187,26 @@ const { data: flow } = await res4.json();   // [{ date, net_amount, r0_net, ... 
 // 研报（贵州茅台，前3页）
 const res5 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/research?code=600519&pages=3");
 const { data: reports } = await res5.json(); // [{ date, title, org, rating, pdf_url, ... }]
+
+// 基金净值（沪深300ETF 历史）
+const res6 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/fund-nav?code=510300");
+const { data: nav } = await res6.json();      // [{ date, nav, acc_nav, equity_return }]
+
+// 交易日历
+const res7 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/trade-calendar?start=2015-01-01");
+const { data: cal } = await res7.json();      // ["2015-01-05", ...]
+
+// 国债收益率
+const res8 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/bond-yield?start=2018-01-01");
+const { data: bond } = await res8.json();     // [{ date, cn_10y, cn_2y, ... }]
+
+// 两融账户
+const res9 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/margin-account?start=2020-01-01");
+const { data: margin } = await res9.json();   // [{ date, fin_balance, personal_investors, ... }]
+
+// 两市成交额
+const res10 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/market-turnover");
+const { total_amount } = await res10.json();  // 元
 ```
 
 已开启 `Access-Control-Allow-Origin: *`，github.io / pages.dev 等静态看板可直接 `fetch`。
