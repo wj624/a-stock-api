@@ -83,6 +83,15 @@
 - 深交所 `fund.szse.cn` 只提供**当前快照**，Worker 自动翻完所有页（pagesize 强制 20）再返回，`snapshot_date` 取自其返回的 `metadata.subname`。
 - 返回 `data[].shares_10k` 即为份额（万份）；`unit` 字段也标明了单位。
 
+**容错约定（下游可按此判定，很重要）**：
+
+- 上交所对 Cloudflare 出口也会偶发限流（回空 / HTML 而不是 JSON）。Worker 内部**快速重试 1 次**。
+- **空结果绝不写入 KV 缓存**。这条是 2026-11-04 踩出来的坑：上游失败被吞成 `200 + data: []`
+  并缓存 1 小时，下游据此认定「当天确实没有数据」，于是一整天反复拿到同一份空表而毫无报警
+  —— 实测 9 天里有 5 天就这么静默丢了。
+- 因此：**`data: []` 不等于「这天没数据」**。上游确实失败时会额外带 `upstream_error`
+  字段说明原因；看到它就该换源复核，而不是当作空值使用。
+
 示例：`/api/etf-shares?exchange=SZ`、`/api/etf-shares?exchange=SH&date=2026-09-18`、`/api/etf-shares?code=510300`
 
 ### `GET /api/fund-flow` — 个股 / ETF 资金流（日度四档单净额）
