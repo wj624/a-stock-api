@@ -11,6 +11,11 @@
 //   - 国债收益率 /api/bond-yield：东财 datacenter（RPTA_WEB_TREASURYYIELD）
 //   - 两融账户 /api/margin-account：东财 datacenter-web（RPTA_WEB_MARGIN_DAILYTRADE）
 //   - 两市成交额 /api/market-turnover：腾讯行情 qt.gtimg.cn（指数实时成交额）
+//   - 指数估值 /api/index-valuation：蛋卷基金 danjuanfunds.com（PE/PB 历史分位 + ROE + 股息率）
+//   - 境内资金面 /api/cn-liquidity：中国货币网（SHIBOR 八期限 + 银行间回购定盘 FR/FDR）
+//   - ETF 折溢价 /api/etf-premium：腾讯行情价 vs 东财 pingzhongdata 净值（自算，不依赖 IOPV）
+//   - 市场宽度 /api/market-breadth：东财 push2ex（涨跌分布 + 涨停池 + 跌停池，仅当日快照）
+//   - 国债曲线 /api/cn-rates：东财 datacenter 的尾部窗口切片（/api/bond-yield 的轻量版）
 //
 // 注意：本仓库是"代码老家"；真正被各看板调用的是「部署后的 Worker 网址」，不是 GitHub 仓库本身。
 
@@ -672,6 +677,52 @@ async function fetchCnLiquidity(days) {
   return { rows: series, derived, latest: last, errs };
 }
 
+// ── 国债收益率曲线（轻量切片版）：只取最近 N 个交易日 ──────────
+// /api/bond-yield 是「全历史」口径（默认从 2015 起翻 12 页），一次几十万字节，
+// 不适合每天给看板/邮件拉一次。这里复用同一抓取函数，翻最少的页数、只留尾部 N 行，
+// 并派生期限利差（上游只给 10Y-2Y，5Y-2Y / 30Y-10Y 自己算）。
+async function fetchCnRates(days) {
+  const pages = Math.min(4, Math.max(1, Math.ceil(days / 480)));
+  const all = await fetchBondYield("2100-01-01", false, pages);
+  const tail = all.slice(-days);
+  if (!tail.length) return { rows: [], derived: {}, latest: null };
+
+  const sp = (a, b) => (a != null && b != null) ? +((a - b)).toFixed(4) : null;
+  // 上游偶发返回「只有日期、各期限全 null」的行（节假日/补数占位）。
+  // 直接留着会让曲线断点、按下标取最新值也会取到空值，这里先剔除。
+  const rows = tail
+    .filter((r) => [r.cn_2y, r.cn_5y, r.cn_10y, r.cn_30y].some((v) => typeof v === "number"))
+    .map((r) => ({
+      date: r.date,
+      cn_2y: r.cn_2y, cn_5y: r.cn_5y, cn_10y: r.cn_10y, cn_30y: r.cn_30y,
+      cn_10y_2y: r.cn_10y_2y,
+      cn_5y_2y: sp(r.cn_5y, r.cn_2y),
+      cn_30y_10y: sp(r.cn_30y, r.cn_10y),
+    }));
+  if (!rows.length) return { rows: [], derived: {}, latest: null };
+
+  const latest = rows[rows.length - 1];
+  // 变化量按「最近 n 个有效值」算，与 tailDeltaBp 同口径（避免个别缺失点把结果打成 null）
+  const chgBp = (k, n) => {
+    const vals = [];
+    for (let i = rows.length - 1; i >= 0 && vals.length <= n; i--) {
+      const v = rows[i][k];
+      if (typeof v === "number" && isFinite(v)) vals.push(v);
+    }
+    if (vals.length <= n) return null;
+    return +((vals[0] - vals[n]) * 100).toFixed(1);
+  };
+  const derived = {
+    cn_10y_chg_20d_bp: chgBp("cn_10y", 20),
+    cn_10y_chg_5d_bp: chgBp("cn_10y", 5),
+    cn_10y_2y_chg_20d_bp: chgBp("cn_10y_2y", 20),
+    cn_10y_ma20: tailAvg(rows, "cn_10y", 20),
+    // 曲线形态：10Y-2Y 为负 = 倒挂（历史上极少见，是宽松预期极强的信号）
+    inverted: latest.cn_10y_2y != null ? latest.cn_10y_2y < 0 : null,
+  };
+  return { rows, derived, latest };
+}
+
 // ── ETF 折溢价：二级市场收盘价（腾讯）vs 单位净值（东财 pingzhongdata）──
 // 不依赖任何「IOPV 实时估值」接口（那类接口全在 push2 上，被 WAF 挡）。
 // 折溢价率 =（市价 − 净值）/ 净值 × 100，日频足够判断申赎情绪。
@@ -1080,6 +1131,37 @@ export default {
       }
     }
 
+    // /api/cn-rates?days=250
+    if (url.pathname === "/api/cn-rates") {
+      const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "250", 10) || 250, 20), 1200);
+      const key = `cnrates:${days}`;
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const r = await fetchCnRates(days);
+        if (!r.rows.length) return json({ error: "cn-rates 无数据" }, 502);
+        const payload = {
+          days, count: r.rows.length,
+          unit: "收益率 %；cn_5y_2y / cn_30y_10y / cn_10y_2y 为利差 %（×100 即 bp），派生字段为 bp",
+          fields: {
+            cn_2y: "2 年期国债到期收益率", cn_5y: "5 年期", cn_10y: "10 年期", cn_30y: "30 年期",
+            cn_10y_2y: "10Y-2Y 期限利差（上游自带）",
+            cn_5y_2y: "5Y-2Y（本端点派生）", cn_30y_10y: "30Y-10Y（本端点派生）",
+          },
+          note: "覆盖最近 days 个交易日；修 curve 形态看 cn_10y_2y，为负即倒挂。"
+            + "与 /api/bond-yield 同源（东财 RPTA_WEB_TREASURYYIELD），但只回尾部窗口、体积小得多。",
+          latest: r.latest, derived: r.derived,
+          updated: Date.now(), data: r.rows,
+        };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "cn-rates fetch failed", message: String(e.message || e) }, 502);
+      }
+    }
+
     // /api/margin-account?start=2018-01-01
     if (url.pathname === "/api/margin-account") {
       const start = url.searchParams.get("start") || "2018-01-01";
@@ -1256,6 +1338,7 @@ export default {
         "cn-liquidity": "/api/cn-liquidity?days=60  (SHIBOR 八期限 + DR001/DR007/DR014，单位 %)",
         "etf-premium": "/api/etf-premium?codes=510300,159919  (折溢价率 %，附 stale 标记)",
         "market-breadth": "/api/market-breadth  (涨跌家数/涨停跌停/连板高度，仅当日)",
+        "cn-rates": "/api/cn-rates?days=250  (国债 2/5/10/30Y 曲线 + 期限利差 bp，尾部窗口)",
       },
       examples: {
         "创业板指": "sz399006",
