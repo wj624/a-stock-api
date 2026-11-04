@@ -71,6 +71,44 @@
 
 > 注：中证官网对指数基日（inception）当天的 `open/high/low/volume` 常为 `null`，这是上游数据本身如此，与原 AKShare `stock_zh_index_hist_csindex` 行为一致，看板侧已兼容。
 
+### `GET /api/etf-shares` — ETF 份额（上交所历史 / 深交所当前快照）
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `exchange` | `SH`（上交所，按日期查历史） / `SZ`（深交所，当前快照） / `ALL`（两者合并） | `ALL` |
+| `date` | 上交所历史查询日 `YYYY-MM-DD`（仅 `SH`/`ALL` 生效；深交所忽略） | 今天 |
+| `code` | 可选，按 6 位代码过滤 | 无 |
+
+- 上交所 `query.sse.com.cn` 按 `STAT_DATE` 返回当日全部 ETF 份额（单位 **万份**）。
+- 深交所 `fund.szse.cn` 只提供**当前快照**，Worker 自动翻完所有页（pagesize 强制 20）再返回，`snapshot_date` 取自其返回的 `metadata.subname`。
+- 返回 `data[].shares_10k` 即为份额（万份）；`unit` 字段也标明了单位。
+
+示例：`/api/etf-shares?exchange=SZ`、`/api/etf-shares?exchange=SH&date=2026-09-18`、`/api/etf-shares?code=510300`
+
+### `GET /api/fund-flow` — 个股 / ETF 资金流（日度四档单净额）
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `code` | 6 位代码，支持 `sh/sz/bj` 前缀或后缀 `.SH` 等写法 | `510300` |
+| `days` | 取最近 N 日（1–240） | `60` |
+
+直连新浪 `MoneyFlow.ssl_qsfx_zjlrqs`。`code` 会自动按号段推导市场前缀（`5/6/9` → `sh`，`8/92` → `bj`，其余 → `sz`）。返回 `net_amount` 单位为**元**，另含 `r0_net`（超大单净额）、`net_ratio`（净额占成交额比）等。
+
+示例：`/api/fund-flow?code=510300&days=60`
+
+### `GET /api/research` — 研报（含评级 / 目标价 / 机构）
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `code` | 6 位股票代码（个股研报） | `600519` |
+| `pages` | 翻页数（1–10，每页 100 条） | `3` |
+| `qType` | `0` 个股研报 / `1` 行业研报 | `0` |
+| `industry` | 行业研报时的东财行业码（如 `1238`），或 `*` 全行业 | `*` |
+
+直连东财 `reportapi.eastmoney.com`。返回每条研报的 `date / title / org / rating（评级，如"买入"） / industry / eps_this_year / eps_next_year / pdf_url` 等。
+
+示例：`/api/research?code=600519&pages=3`、`/api/research?qType=1&industry=1238&pages=5`
+
 ## 看板里怎么调用
 
 ```js
@@ -81,6 +119,18 @@ const { data } = await res.json();
 // 中证自定义指数（如红利低波 H30269）
 const res2 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/csindex?symbol=H30269&start=20160803");
 const { data: hldb } = await res2.json();
+
+// ETF 份额（深交所当前快照）
+const res3 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/etf-shares?exchange=SZ");
+const { data: etf } = await res3.json();   // [{ code, name, shares_10k, ... }]
+
+// 资金流（沪深300ETF，近60日）
+const res4 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/fund-flow?code=510300&days=60");
+const { data: flow } = await res4.json();   // [{ date, net_amount, r0_net, ... }]
+
+// 研报（贵州茅台，前3页）
+const res5 = await fetch("https://a-stock-api.wj4020410.workers.dev/api/research?code=600519&pages=3");
+const { data: reports } = await res5.json(); // [{ date, title, org, rating, pdf_url, ... }]
 ```
 
 已开启 `Access-Control-Allow-Origin: *`，github.io / pages.dev 等静态看板可直接 `fetch`。
