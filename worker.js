@@ -522,9 +522,22 @@ export default {
       } catch (_) { /* ignore */ }
 
       let sh = [], sz = null, shDate = date, szDate = "";
+      // 上交所对 Cloudflare 出口也会偶发限流（回空/HTML 而非 JSON），一次失败就丢一天。
+      // 2026-11-04 实测单次成功率只有 ~40%（9 天里 5~6 天首抓为空、隔一会儿再问就有），
+      // 因此这里重试 3 次、每次间隔 400ms —— 若真是按 IP 的短窗口限流，拉开间隔比连续重试有效。
+      let shErr = null;
       if (exchange === "SH" || exchange === "ALL") {
-        try { sh = await fetchSseEtfShares(date); shDate = (sh[0] && sh[0].date) || date; }
-        catch (e) { sh = []; }
+        for (let attempt = 0; attempt < 3 && sh.length === 0; attempt++) {
+          if (attempt) await new Promise((r) => setTimeout(r, 400));
+          try {
+            sh = await fetchSseEtfShares(date);
+            shDate = (sh[0] && sh[0].date) || date;
+            shErr = null;
+          } catch (e) {
+            sh = [];
+            shErr = String(e.message || e);
+          }
+        }
       }
       if (exchange === "SZ" || exchange === "ALL") {
         try { const s = await fetchSzseEtfShares(); sz = s.rows; szDate = s.snapshot_date; }
@@ -538,9 +551,15 @@ export default {
         sz: { date: szDate, count: sz ? sz.length : 0 },
         unit: "shares_10k = 万份", updated: Date.now(), data: combined,
       };
-      ctx.waitUntil(
-        env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {})
-      );
+      // 空结果绝不写缓存：上游一次失败会被缓存 1 小时，下游据此判定「当天无数据」，
+      // 结果是一整段时间里反复拿到同一份空表（2026-11-04 就是这样静默丢了 5 天）。
+      // 同时把空表的原因显式回给调用方，别让它看起来像「确实没有数据」。
+      if (combined.length === 0 && shErr) payload.upstream_error = shErr;
+      if (combined.length > 0) {
+        ctx.waitUntil(
+          env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {})
+        );
+      }
       return json(payload);
     }
 
