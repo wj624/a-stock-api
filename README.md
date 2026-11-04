@@ -152,6 +152,68 @@
 
 > 东财 push2 对 Cloudflare 出口 IP 有 WAF 拦截（502），故成交额走腾讯。
 
+### `GET /api/index-valuation` — 指数估值（PE/PB 及历史分位）
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `codes` | 指数代码，逗号分隔。接受 `SH000300` / `sh000300` / `000300` 三种写法 | `SH000300,SZ399006` |
+
+上游 `danjuanfunds.com/djapi/index_eva/detail/{code}`（免 Key）。**这是 legulegu（云端 401）与中证官网（估值页改版、接口 404）的替代源。**
+
+```json
+{"count":2,"unit":{"pe_pct":"0~1, 越大越贵","roe":"小数(0.0993=9.93%)","dividend_yield":"小数","peg":"倍"},
+ "data":[{"code":"SH000300","name":"沪深300","date":"2026-11-03","pe":13.504,"pb":1.3403,
+          "pe_pct":0.6736,"pb_pct":0.2096,"pe_over_history":0.3264,"roe":0.0993,
+          "dividend_yield":0.0302,"peg":0.9514,"level":"mid","level_int":1}]}
+```
+
+> **两个分位字段互为倒数**：`pe_pct` + `pe_over_history` 恒等于 1。下游统一只用 `pe_pct`（0=最便宜，1=最贵）。
+> 用错不会报错、数字也完全合理，只是把「贵」读成「便宜」——这是本端点最容易埋的坑。
+> `upstream_bond_yield` 是上游字段，口径不明（常数级），**不要拿去算股债性价比**。
+
+### `GET /api/cn-liquidity` — 境内资金面（SHIBOR + 银行间回购定盘）
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `days` | 返回最近多少个交易日（5~250） | `60` |
+
+上游中国货币网两个 form-urlencoded POST：`ShiborHis`（八期限）+ `FrrHis`（回购定盘）。
+
+返回 `latest`（最新一天）、`derived`（派生指标，单位 bp）、`data`（按日期升序的序列）。字段含义写在响应的 `fields` 里。
+**`FDR001/007/014` 就是 DR001/DR007/DR014**（存款类机构质押式回购定盘利率），DR007 是央行公开市场操作实际盯的锚。
+
+| 关键限制 | 说明 |
+|---|---|
+| `FrrHis` 忽略 `startDate` | 永远只回最近约 **21 个交易日**，而 SHIBOR 能给 60+ 天。下游若把两者画一张图，左侧会出现「只有 SHIBOR、没有 DR007」的空白，需从首个 DR007 有效点起画 |
+| 没有 OMO | 央行公开市场操作（净投放/回笼）的公开无 Key 接口未找到，暂不提供。资金面松紧用 DR007 相对 20 日均线的偏离代替 |
+
+### `GET /api/etf-premium` — ETF 折溢价率
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `codes` | 6 位代码或带市场前缀，逗号分隔，最多 30 个 | `510300,159919` |
+
+> **折溢价 =（市价 − 净值）/ 净值 × 100**。价格取腾讯 `qt.gtimg.cn`（GBK），净值取东财 `pingzhongdata`。
+> 没有用任何「实时 IOPV」接口——那类接口全在 `push2` 上，对 Cloudflare 出口 502。
+>
+> **`stale` 字段必须看**：价格日期与净值日期不同（盘中必然如此）时为 `true`，
+> 此时该值只反映「相对上一日净值的偏离」，不能当收盘折溢价用。
+
+### `GET /api/market-breadth` — 市场宽度（涨跌家数 / 涨停跌停 / 连板高度）
+
+无参数。上游东财 `push2ex.eastmoney.com` 三个接口并发（涨跌幅分布 / 涨停池 / 跌停池），
+**与已知被 WAF 拦的 `push2.eastmoney.com` 不同域名，实测 Cloudflare 出口可用。**
+
+| 字段 | 口径 |
+|---|---|
+| `up` / `down` / `flat` / `total` | 由「涨跌幅分布直方图」求和。已与 push2 的 `f104/f105/f106` 交叉校验，差异 <2%（是否含北交所与停牌股） |
+| `limit_up` / `limit_down` | 涨停池 / 跌停池的 `tc` |
+| `max_streak` / `streak_dist` | 连板高度 = 池内 `lbc` 最大值；分布按 `lbc` 计数 |
+| `history_supported` | **恒为 `false`** |
+
+> **这三个接口忽略 `date` 参数，永远返回当日快照**（实测传 `20261103` 仍回 `qdate=20261104`）。
+> 所以「回填历史」在数据源层面不可能，下游只能每天存一份自建序列。
+
 ---
 
 ## 3. 单位与口径约定（改代码前必须核对）
@@ -163,6 +225,12 @@
 | `market-turnover` → `amount` / `total_amount` | 元 | 腾讯字段 35 的第 3 段 |
 | `bond-yield` → `cn_*` | % | — |
 | `margin-account` → `*_balance` | 上游原值（约亿元） | 不换算 |
+| `index-valuation` → `pe` / `pb` | 倍 | — |
+| `index-valuation` → `pe_pct` / `pb_pct` | 0~1 分位 | × 100 得百分位；**越大越贵** |
+| `cn-liquidity` → `dr007` / `shibor_*` | % 年化 | — |
+| `cn-liquidity` → `derived.*_bp` | bp | 1bp = 0.01 个百分点 |
+| `etf-premium` → `premium_pct` | % | 已乘 100，正=溢价 |
+| `market-breadth` → 各家数 | 家 | 整数 |
 | `kline` → `volume` | 手 | — |
 | `fund-nav` → `nav` | 元 | 日期需 +8h 修正 |
 
@@ -188,8 +256,17 @@
 | `/api/margin-account` | `margin_trading(code)` / `margin_trading_backup` | **4.1** / 备用源 | 东财 / 交易所官方 | 上游是**个股明细**，我们是**市场总量** |
 | `/api/market-turnover` | *（无直接对应）* | — | `qt.gtimg.cn` | 上游有 `tdx_daily_package`(§1.3) 可算，但太重 |
 | `/api/csindex` | *（无直接对应）* | — | `csindex.com.cn` | 上游 §12 只有成分/权重/估值，没有自定义指数日线 |
+| `/api/index-valuation` | *（上游用 legulegu）* | **§12.1** | `danjuanfunds.com` | 上游走 legulegu（云端 401），我们换蛋卷；字段名不同（`yeild` 是上游拼写） |
+| `/api/cn-liquidity` | *（无直接对应）* | — | `chinamoney.com.cn` | 上游宏观章节只有美债/中债收益率，没有 SHIBOR/DR 资金面 |
+| `/api/etf-premium` | *（无直接对应）* | — | 腾讯价 + 东财净值 | 上游 §12 有「指数估值」，但没有 ETF 折溢价 |
+| `/api/market-breadth` | *（无直接对应）* | — | `push2ex.eastmoney.com` | 上游 §4 有涨停板类函数，但口径/字段不同 |
 
-**「无直接对应」的四个**（`fund-nav` / `market-turnover` / `csindex` / `margin-account` 的市场总量视角）是我们自己实现的，上游更新通常不影响它们；但要留意上游若新增同类端点，优先改用上游写法以便统一维护。
+**「无直接对应」的八个**（`fund-nav` / `market-turnover` / `csindex` / `margin-account` 的市场总量视角，
+以及 2026-11 新增的 `index-valuation` / `cn-liquidity` / `etf-premium` / `market-breadth`）是我们自己实现的，
+上游更新通常不影响它们；但要留意上游若新增同类端点，优先改用上游写法以便统一维护。
+
+> 2026-11 这四个端点**不来自上游 skill**，是自研的。同步上游时**不要**去 SKILL.md 里找它们的对应章节，
+> 只在「上游是否新增了同类能力」这个角度扫一眼即可。
 
 ---
 
@@ -335,7 +412,7 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=3242358d09b1b6024863cfdf939def5d 
 
 ---
 
-## 7. 代码结构导览（worker.js，约 760 行）
+## 7. 代码结构导览（worker.js，约 1270 行）
 
 单文件，无依赖。按顺序大致是：
 
@@ -351,6 +428,12 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=3242358d09b1b6024863cfdf939def5d 
 | 研报 | `emNormCode` + `fetchResearch` | 同名 |
 | 东财数据中心 | `DC_URL` / `DC_WEB_URL` + `fetchFundNav` / `fetchTradeCalendar` / `fetchBondYield` / `fetchMarginAccount` | 同名 |
 | 成交额 | `fetchMarketTurnover`（腾讯 GBK） | 同名 |
+| 缓存写入策略 | `shouldCacheDate` / `CACHE_FRESH_DAYS` —— 历史日期不写 KV（见 §9） | `function shouldCacheDate` |
+| 估值 | `djIndexCode` + `fetchIndexValuation`（蛋卷） | 同名 |
+| 资金面 | `gpost`（带 body 的 POST）+ `cmHistory` + `fetchCnLiquidity` | 同名 |
+| 折溢价 | `txCode` + `fetchTxQuotes` + `fetchLatestNav` + `fetchEtfPremium`（含 `mapLimit` 并发闸门） | 同名 |
+| 市场宽度 | `p2exGet` + `fetchMarketBreadth`（`Promise.allSettled`，允许部分成功） | 同名 |
+| 日期工具 | `bjDate(ts)` 北京零点时间戳→日期、`bjToday()` 北京今天（**Worker 跑在 UTC，别直接 `toISOString`**） | 同名 |
 | 路由 | `export default { async fetch(request, env, ctx) }`，`if (url.pathname === "/api/xxx")` 串联，每个分支自带 KV 读写 | 文件后半 |
 | 根路径 | `/` 返回端点索引（自描述，便于人工排查） | 末尾 |
 
@@ -427,6 +510,10 @@ Cloudflare API Token 与 GitHub PAT **只存在本地环境变量 / GitHub Secre
 |---|---|
 | 绝大多数端点 | 3600s（1 小时） |
 | `/api/market-turnover` | 300s（5 分钟，行情类） |
+| `/api/market-breadth` | 300s（盘中每分钟在变；拿不到有效分布时不写） |
+| `/api/etf-premium` | 600s（净值一天只更新一次，价格收盘后不变） |
+| `/api/cn-liquidity` | 1800s（资金价格日频） |
+| `/api/etf-shares`（历史日期） | **不写缓存**，见下 |
 
 进程内还有一层：K 线分页 / 深交所翻页时用 `Promise.all` 并发拉取，单次请求的子请求数要控制在免费额度内（50）。
 
@@ -441,6 +528,27 @@ if (combined.length > 0) {
 
 原因见 §2 `etf-shares` 的容错约定：空表一旦被缓存，下游会把「故障」当成「当天没数据」，**静默丢数据且不报警**。
 上游失败时额外回 `upstream_error` 字段，让「空」和「失败」在语义上可区分。
+
+### 写配额：历史日期不写缓存
+
+KV 免费额度是 **1000 次「写不同键」/天，且全账号共享**（读 10 万/天）。
+`etf-shares` 回填 250 天就是 250 个键 = 250 次写，一天手动触发两轮就吃掉一半配额。
+
+但**历史日期的份额抓过一次就永不变化**，给它写一个 1 小时 TTL 的便签纯属浪费。所以：
+
+```js
+const CACHE_FRESH_DAYS = 5;
+function shouldCacheDate(dateStr) {   // 只有最近 5 个自然日内的日期才回写
+  const m = String(dateStr || "").match(/^(\d{4})-?(\d{2})-?(\d{2})$/);
+  if (!m) return true;
+  const t = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+  return (Date.now() - t) / 86400000 <= CACHE_FRESH_DAYS;
+}
+```
+
+效果：250 天首轮回填的写入次数从 **250 次降到 5 次**，而为「最近几天会变」保留缓存的意义完全不变。
+
+> 新增端点时沿用这个思路：**只缓存会变的东西**。日频、当日的写缓存；历史、一次性的不写。
 
 ### 验证 Worker 输出的三种办法
 
@@ -514,7 +622,9 @@ requests.post(
 
 | 端点 | 为什么不提供 |
 |---|---|
-| `/api/index-valuation`（指数历史 PE/PB） | 上游乐咕乐股有阿里云反爬（`acw_tc` 挑战），即便先取页面 CSRF+Cookie，API 仍返回 401。Cloudflare 侧无法稳定复刻 |
+| ~~`/api/index-valuation`~~ | **已实现（2026-11）**：legulegu 走不通（阿里云反爬 `acw_tc` + 401），中证官网估值页改版后接口全 404，最终改用**蛋卷基金** `danjuanfunds.com/djapi/index_eva/detail/{code}`，免 Key、含 PE/PB 双分位 + ROE + 股息率。原「做不到」的结论已作废 |
+| 指数估值的**历史序列** | 蛋卷只给「最新一天 + 一条周频 PE 曲线（`pe_history`）」。要日频历史 PE/PB 曲线仍需付费源，暂不提供；当前靠 `pe_pct` 分位本身已能回答「现在贵不贵」 |
+| 央行公开市场操作（OMO 净投放） | 中国货币网的 OMO 接口路径未找到（试过 8 个候选全 404），央行官网只有 HTML/PDF 公告。资金面松紧改用 DR007 相对 20 日均线的偏离表达 |
 | `/api/spot`（全市场逐股快照） | 东财 push2 强制 100 条/页，全市场 5900+ 只需 60 页，超出免费 Worker 单请求子请求上限。成交额需求请用 `/api/market-turnover` |
 | `/api/etf-shares` 深交所**历史** | 深交所 `fund.szse.cn` 只给当前快照；历史需走 `www.szse.cn/api/report/ShowReport?...CATALOGID=scsj_fund_jjgm` 的 **xlsx**（`SHOWTYPE=JSON` 返回 500）。Worker 里解析 xlsx 不稳，已改由各仓库**自行直连解析**（`national-team-etf-flow` / `etf-lsi` 均如此） |
 
@@ -529,6 +639,10 @@ requests.post(
 | 2026-11-04 | `etf-shares`：空结果不再写 KV；失败回 `upstream_error`；上交所请求重试 3 次/400ms；请求头与本机客户端对齐（附对照实验：根因是出口 IP 而非 UA） |
 | 2026-11-04 | **修复自动部署**：仓库 Actions Secrets 一直为空，`deploy.yml` 的 `wrangler deploy` 从未成功；补齐后验证通过（Version ID `e20dd390`） |
 | 2026-11-04 | README 重写为维护手册：AI 同步提示词、上游映射表、Runbook、排障手册、下游契约 |
+| 2026-11-04 | **新增 4 个端点**（共 14 个）：`index-valuation`（蛋卷估值）/ `cn-liquidity`（SHIBOR+DR007）/ `etf-premium`（价 vs 净值自算）/ `market-breadth`（push2ex 涨跌分布+涨停池+跌停池） |
+| 2026-11-04 | `etf-shares` 缓存写入加 `shouldCacheDate`：历史日期不再写 KV，250 天回填的写次数 250 → 5 |
+| 2026-11-04 | `deploy.yml` 加**部署后冒烟**：真打 7 个线上端点，结果写进 Step Summary。理由是「部署成功 ≠ 端点可用」——push2 那种「只有 Cloudflare 出口才被拦」的坑，本地怎么测都通 |
+| 2026-11-04 | 首批下游接入：`wj624/etf-lsi` 新增 ⑨境内资金面 ⑩市场宽度 ⑪指数估值 ⑫ETF折溢价 四个看板面板 |
 
 ---
 
