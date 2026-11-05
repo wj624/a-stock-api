@@ -849,3 +849,56 @@ ValueError: 'M' is no longer supported for offsets. Please use 'ME' instead.
 | `etf-lsi` | `606958f` | — | `8e8f74f`（自动产物 commit 会继续前移，属正常） |
 
 > **给 AI 的硬约束**：这 3 个仓的 pandas **必须锁 `<3`**，不要「简化」成 `<4` 或去掉上界；`resample('ME')` 不要改回 `'M'`。改依赖时**必须同时改 `requirements.txt` 和 workflow 的 `pip install` 行** —— 第一次补测就是这样崩的。另外这 6 仓**没有单元测试套件**，上述「实测」指真实 workflow 执行 + 产物核验，改完代码仍应手动 dispatch 一次确认。
+
+### G. 后续策略调整 · 按体积自动清理（2026-11-05 同日）
+
+> **本仓情况**：本仓**没有** `monthly-snapshot.yml`（只有 6 个文件、0.3 MB，无膨胀风险）；本节是 6 仓统一策略说明，便于理解全局，无需对本仓做任何改动。
+>
+> **优先级说明**：A / B / D 节记录的是当天**第一版**整改状态，原文保留不改以便追溯决策过程；关于「每月清理」的部分自本节起**以本节为准**：
+> - A 表里的「停用 `schedule`」= 停用**旧版「每月 1 号无条件 force 重写 main」**的 schedule；
+> - D 节「绝对不要恢复 monthly-snapshot 自动 schedule」= 不要恢复**上面那个旧版**；
+> - 本节新增的「按体积体检 schedule」是**有意保留的新机制，不要删、不要改回每月无条件执行**。
+
+#### 为什么要调整
+
+用户指出：当初设计每月清理，是为了防止「每日产物入库」让仓库长期运行后体积膨胀。第一版整改只从「安全 / 可回滚」角度停用了 schedule，**没有回应「空间封顶」这个原始诉求**，等于把自动能力关掉了。实测后确认这个担心成立：
+
+| 实测项 | 数值 |
+|---|---|
+| 6 仓当时合计体积 | 约 67 MB |
+| 最大单个文件 | 4.4 MB（GitHub 单文件硬限 100 MB） |
+| 仓库年龄 | 2~6 天（全部建于 2026-10-31 ~ 11-04） |
+| 稳定后估算增长 | 约 1~2 MB/天（前几天叠加了整改提交，偏高） |
+| 放着不管碰线时间 | 大半年 ~ 2 年到 1 GB 建议线 |
+| GitHub 官方口径 | 理想 < 1 GB、强烈建议 < 5 GB，**不是免费版封顶** |
+| 6 仓可见性 | 全部 **public**，Actions 分钟数免费不限量 |
+
+结论：不会立刻被封，但会变慢、可能收到 GitHub 提醒邮件，所以「自动封顶」确实需要保留——只是不能再用「每月无条件强推」这种不可回滚的方式。
+
+#### 改成什么
+
+`.github/workflows/monthly-snapshot.yml`：
+
+- `on.schedule` 改为**每周一 UTC 03:00（北京 11:00）只做一次「体积体检」**：读一次仓库 `size`，**低于 500 MB 就直接结束，一个字节都不改、绝不碰 `main` 历史**。
+- 仅当 `size >= 500 MB（512000 KB）` 时才执行剪断。按 67 MB 起步、1~2 MB/天估算，约 8 个月~1 年才第一次真正动刀；清完回到约 10 MB 再重新累积，永远远低于 1 GB。
+- `workflow_dispatch` 保留，新增 `force` 布尔输入（**默认 false**）：手动触发默认「只体检、不改动」，勾选 `force` 才忽略阈值立即清理。
+- 原有护栏**全部保留**：`README.md` / `KEY_FILE` 存在、`git ls-files >= 8`、JSON 合法性校验、root commit 用 Git Data API（`parents: []`）、不走 `git push --force`、不触发 push 工作流、旧 HEAD 记入 artifact `retention-days: 365`、回滚命令写进日志、`concurrency` 互斥。
+- **针对「按体积触发」新增一道护栏**：所有被跟踪文件必须 < 50 MB。体积突然暴涨通常是误提交大文件，绝不能把这种异常树固化成「唯一的 root commit」。
+- guard 的 JSON 校验从「只查根目录 `*.json`」扩展到「`git ls-files -z '*.json'` 的全部被跟踪 JSON」。
+- 体积读取优先 `gh api repos/... --jq .size`，失败回落 `github.event.repository.size`；两者都取不到时**安全跳过、不清理**。
+
+#### 给 AI 的维护边界（追加，不替代 D 节）
+
+1. **不要**把 `on.schedule` 改回「每月 1 号无条件执行」，不要删掉体积判断或改掉 `THRESHOLD_KB`。
+2. **不要**把 `force` 默认值改成 `true`，不要去掉手动入口「默认只体检」的语义。
+3. **不要**删掉 50 MB 单文件护栏或全量 JSON 校验；它们是「按体积自动」特有的防误固化措施。
+4. 想立刻清理：Actions 页手动 dispatch 并**勾选 force**；只想体检：直接 dispatch 不勾选。
+5. 清理后 `main` 变成 root commit，**外部克隆 / fork 需要重新 clone**；回滚命令在 run 日志与 artifact 里，保留 365 天。
+6. 阈值 500 MB 可调，但**不要调到 1 GB 以上**（失去提前封顶意义），也**不要调到 100 MB 以下**（频繁剪历史）。
+7. 判断是否需要清理看的是仓库 `size`（`gh api repos/<owner>/<repo> --jq .size`，单位 KB），不是文件个数或提交数。
+8. 线上写操作照旧：精确 `git add`、中文 commit、`git pull --rebase`、**绝不 force**。
+
+#### 验证与回滚
+
+- 验证：改完用 `yaml.safe_load` 校验；在 Actions 手动 dispatch（**不勾选 force**）应看到 `below threshold: nothing to do, main history untouched`，且 `main` HEAD 不变、工作区无改动。
+- 回滚本策略：`git revert <本策略 commit>` 即可回到「仅手动入口」的第一版状态；数据资产与其它 workflow 均不受影响。
