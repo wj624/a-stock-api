@@ -223,7 +223,7 @@
 | `days` | `250` | 保留最近多少个交易日，`20 ~ 1200` |
 
 `/api/bond-yield` 的**轻量版**：同源（东财 `RPTA_WEB_TREASURYYIELD`），但只翻最少的页数、
-只回尾部窗口，并且**派生期限利差**。250 天约 35 KB，`bond-yield` 同期要几百 KB。
+只回尾部窗口，并且**派生期限利差**。250 天的数据量远小于 `bond-yield` 同期全量。
 
 ```json
 {
@@ -247,6 +247,45 @@
 > **两个坑**：① 上游偶发返回「只有 `date`、各期限全 `null`」的行（节假日/补数占位），
 > 本端点会**整行剔除**——所以 `count` 会小于请求的 `days`（250 → 约 234），这是正常的，不是漏数。
 > ② 利差列是「%」不是「bp」，`0.3936` 表示 39.4 bp；直接当 bp 用会小 100 倍，而且不报错。
+
+### `GET /api/commodity-quote` — 商品实时 / 收盘快照
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `symbols` | 逗号分隔；国内主力连续 `AU0`/`AG0`/`SC0`，外盘连续 `GC`/`SI`/`CL`/`OIL` | 全部品种 |
+
+新浪 `hq.sinajs.cn`（`nf_` / `hf_` 前缀，GBK）。返回 `{symbols, count, updated, note, data}`，每条含 `symbol/name/market/unit/venue` 与 `last/open/high/low/bid/ask/pre_settle/date/time`（国内另含 `volume/open_interest/avg_price`）；单品种缺失只记 `upstream_error`，不影响其余。
+
+### `GET /api/futures-kline` — 期货主力连续日 K
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `symbol` | 主力连续代码，如 `AU0` / `AG0` / `SC0` / `RB0` / `M0` | `AU0` |
+| `days` | 返回最近 N 条（1–6000） | `250` |
+| `start` / `end` | 日期过滤 `YYYY-MM-DD` | 空 |
+
+新浪 `InnerFuturesNewService` 主力连续（换月跳空、未复权）。返回 `{symbol, count, unit, note, updated, data}`，每条 `{date, open, high, low, close, settle, volume, open_interest}`；`settle` 上游给 0 时置 `null`。`start/end/days` 为本地裁剪全历史，不增加上游流量。
+
+### `GET /api/sge-spot` — 上金所黄金 / 白银现货日线
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `instrument` | `Au99.99` / `Au(T+D)` / `Ag(T+D)` / `Pt99.95` | `Au99.99` |
+| `days` | 保留最近 N 条；`0` / 不传 = 全历史 | `0` |
+
+上金所 `sge.com.cn/graph/Dailyhq`（POST，2016-12 起）。返回 `{instrument, count, unit, note, updated, data}`，每条 `{date, open, close, low, high}`；白银 `unit` 为元/千克、其余元/克，无成交日（全 0）已剔除。
+
+### `GET /api/global-index` — 全球指数实时 / 收盘快照
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `symbols` | 逗号分隔；`KOSPI` / `HSI` / `FTSE` | `KOSPI` |
+
+新浪 `znb_` 前缀快照（GBK）。返回 `{symbols, count, updated, history_supported, note, data}`，每条含 `symbol/name/region` 与 `last/change/change_pct/open/pre_close/high/low/date/time`。`history_supported` 恒为 `false`（仅实时 / 收盘快照，无历史日 K）；`DJI` / `IXIC` / `N225` 在该前缀实测返回空，未列入。
+
+### `GET /api/macro-ratios` — 跨资产比价（金银比 / 金油比 / 铜金比 + KOSPI/GOLD 信号）
+
+无参数。外盘连续合约日 K（新浪 `GlobalFuturesService`）+ `znb_KOSPI` 快照。返回 `gold_silver` / `gold_oil` / `copper_gold` 三项各自 `{value, chg20_pct, pct250, min250, max250, asof, n}`，以及 `kospi_gold` 的 `{value, hi, lo, signal, dist_hi_pct, dist_lo_pct}`（固定阈值 1.85 / 1.10）；另含 `gold_close` / `kospi` / `asof` / `definitions` / `errs`。`pct250` 为近 250 交易日分位（0=最低，100=最高）。
 
 ---
 
@@ -278,7 +317,7 @@
 ## 4. 上游映射表（同步时照这张表定位）
 
 上游仓库：`simonlin1212/a-stock-data` → 文件 `SKILL.md`（有 `§` 章节号）与 `CHANGELOG.md`（版本变更）。
-下表把**本仓库每个端点**映射到**上游对应章节**，同步时只读这些章节，不必通读 44 万字的 SKILL.md。
+下表把**本仓库每个端点**映射到**上游对应章节**，同步时只读这些章节，不必通读 SKILL.md 全文。
 
 | 本仓库端点 | 上游函数 | 上游 § | 上游真实来源 | 备注 |
 |---|---|---|---|---|
@@ -313,7 +352,7 @@
 上游发新版后，把下面整段连同**新版本号**一起丢给 AI：
 
 ```text
-你正在维护 jw624/a-stock-api —— 一个 Cloudflare Worker 写的 A股数据源代理。
+你正在维护 wj624/a-stock-api —— 一个 Cloudflare Worker 写的 A股数据源代理。
 上游技能包 simonlin1212/a-stock-data 已发布新版本，需要把「与本仓库已有端点相关」的变更同步过来。
 
 请严格按本仓库 README.md 的「§6 维护 Runbook」执行，并遵守「§0 铁律」。
@@ -375,8 +414,8 @@ https://github.com/simonlin1212/a-stock-data/blob/main/CHANGELOG.md
 
 ### Step 1 · 取上游原文
 
-- `CHANGELOG.md` → 变更概述（约 90 KB，读最新一节即可）
-- `SKILL.md` → 具体实现（约 44 万字符，**一定按 `§` 号局部定位**，别整篇读）
+- `CHANGELOG.md` → 变更概述（读最新一节即可）
+- `SKILL.md` → 具体实现（篇幅很长，**一定按 `§` 号局部定位**，别整篇读）
 - 上游有 `tests/` 目录，里面有离线用例可直接借来验证字段映射
 
 ### Step 2 · 定位我方代码
@@ -450,7 +489,7 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=3242358d09b1b6024863cfdf939def5d 
 
 ---
 
-## 7. 代码结构导览（worker.js，约 1345 行）
+## 7. 代码结构导览（worker.js，行数以仓库实际文件为准）
 
 单文件，无依赖。按顺序大致是：
 
@@ -460,7 +499,7 @@ CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=3242358d09b1b6024863cfdf939def5d 
 | 工具函数 | `json()` 统一响应、`normDate/decDate` 日期处理 | `function json` |
 | K 线 | `tencentKlineChunk` → `fetchKlineFull`（分页拼全量） | `async function fetchKline` |
 | 中证 | `fetchCsindex` | 同上 |
-| 通用请求 | `gfetch(url, headers, ms)` —— **带 20s 超时的统一出口，新端点都用它** | `async function gfetch` |
+| 通用请求 | `gfetch(url, headers, ms)` —— **带 20s 超时，所有上游请求统一使用带超时的 gfetch** | `async function gfetch` |
 | ETF 份额 | `fetchSseEtfShares` / `fetchSzseEtfShares`（后者要翻页取快照） | 同名 |
 | 资金流 | `sinaFlowPrefix` + `fetchFundFlow` | 同名 |
 | 研报 | `emNormCode` + `fetchResearch` | 同名 |
@@ -553,6 +592,11 @@ Cloudflare API Token 与 GitHub PAT **只存在本地环境变量 / GitHub Secre
 | `/api/etf-premium` | 600s（净值一天只更新一次，价格收盘后不变） |
 | `/api/cn-liquidity` | 1800s（资金价格日频） |
 | `/api/cn-rates` | 3600s（日频，一天一变） |
+| `/api/commodity-quote` | 300s（盘中实时价） |
+| `/api/futures-kline` | 3600s（日频） |
+| `/api/sge-spot` | 3600s（日频） |
+| `/api/global-index` | 300s（实时快照） |
+| `/api/macro-ratios` | 3600s（日频） |
 | `/api/etf-shares`（历史日期） | **不写缓存**，见下 |
 
 进程内还有一层：K 线分页 / 深交所翻页时用 `Promise.all` 并发拉取，单次请求的子请求数要控制在免费额度内（50）。
@@ -651,7 +695,7 @@ requests.post(
 |---|---|---|
 | `wj624/rotation-monitor` | `kline` / `csindex` | K 线字段名与日期格式（`date/open/close/high/low/volume`） |
 | `wj624/national-team-etf-flow` | `etf-shares`(SH, SZ→仓库内直连) / `fund-nav` / `trade-calendar` | `shares_10k` 单位、`nav` 时区 |
-| `wj624/etf-lsi` | `etf-shares`(SH) / `fund-nav` / `trade-calendar` / **`index-valuation` / `cn-liquidity` / `etf-premium` / `market-breadth` / `cn-rates`** | 同上；且它按「空表必须复核」的语义写的，别把 `upstream_error` 去掉。这 5 个新端点支撑看板 ⑨⑩⑪⑫⑬ 与邮件 ⑤ 板块——**任何一个失败都只让对应面板消失**，不会中断它整轮流水线 |
+| `wj624/etf-lsi` | `etf-shares`(SH) / `fund-nav` / `trade-calendar` / **`index-valuation` / `cn-liquidity` / `etf-premium` / `market-breadth` / `cn-rates`** / `macro-ratios` | 同上；且它按「空表必须复核」的语义写的，别把 `upstream_error` 去掉。这 5 个新端点支撑看板 ⑨⑩⑪⑫⑬ 与邮件 ⑤ 板块——**任何一个失败都只让对应面板消失**，不会中断它整轮流水线 |
 | `wj624/earl-etf-dashboard` | 计划接入 bond-yield / margin-account / market-turnover | 尚未迁移，字段可协商 |
 
 > `national-team-etf-flow` 与 `etf-lsi` 都**只依赖 Worker、或 Worker + 直连双通道**，没有第三层兜底。任何"看起来无害"的空值语义改动，都会直接变成它们的静默数据缺口。
@@ -679,12 +723,12 @@ requests.post(
 | 2026-11-04 | `etf-shares`：空结果不再写 KV；失败回 `upstream_error`；上交所请求重试 3 次/400ms；请求头与本机客户端对齐（附对照实验：根因是出口 IP 而非 UA） |
 | 2026-11-04 | **修复自动部署**：仓库 Actions Secrets 一直为空，`deploy.yml` 的 `wrangler deploy` 从未成功；补齐后验证通过（Version ID `e20dd390`） |
 | 2026-11-04 | README 重写为维护手册：AI 同步提示词、上游映射表、Runbook、排障手册、下游契约 |
-| 2026-11-04 | **新增 4 个端点**（共 14 个）：`index-valuation`（蛋卷估值）/ `cn-liquidity`（SHIBOR+DR007）/ `etf-premium`（价 vs 净值自算）/ `market-breadth`（push2ex 涨跌分布+涨停池+跌停池） |
+| 2026-11-04 | **新增 4 个端点**（累计端点数以 §2 为准）：`index-valuation`（蛋卷估值）/ `cn-liquidity`（SHIBOR+DR007）/ `etf-premium`（价 vs 净值自算）/ `market-breadth`（push2ex 涨跌分布+涨停池+跌停池） |
 | 2026-11-04 | `etf-shares` 缓存写入加 `shouldCacheDate`：历史日期不再写 KV，250 天回填的写次数 250 → 5 |
-| 2026-11-04 | `deploy.yml` 加**部署后冒烟**：真打 7 个线上端点，结果写进 Step Summary。理由是「部署成功 ≠ 端点可用」——push2 那种「只有 Cloudflare 出口才被拦」的坑，本地怎么测都通 |
+| 2026-11-04 | `deploy.yml` 加**部署后冒烟**：真打 13 个 check（以 `deploy.yml` 的 check 列表为准），结果写进 Step Summary。理由是「部署成功 ≠ 端点可用」——push2 那种「只有 Cloudflare 出口才被拦」的坑，本地怎么测都通 |
 | 2026-11-04 | 首批下游接入：`wj624/etf-lsi` 新增 ⑨境内资金面 ⑩市场宽度 ⑪指数估值 ⑫ETF折溢价 四个看板面板 |
-| 2026-11-04 | **新增 `/api/cn-rates`**（共 15 个）：`bond-yield` 的轻量版——只回尾部窗口（250 天约 35 KB vs 几百 KB）、剔除上游「只有日期、各期限全 null」的占位行、派生 `cn_5y_2y` / `cn_30y_10y` 与 bp 口径的变化量。下游 `wj624/etf-lsi` 接入 ⑬国债曲线面板 + 邮件 5.3 小节 |
-| 2026-11-04 | `deploy.yml` 冒烟从 7 个端点扩到 8 个（加入 `cn-rates`） |
+| 2026-11-04 | **新增 `/api/cn-rates`**（累计端点数以 §2 为准）：`bond-yield` 的轻量版——只回尾部窗口（数据量远小于同期全量）、剔除上游「只有日期、各期限全 null」的占位行、派生 `cn_5y_2y` / `cn_30y_10y` 与 bp 口径的变化量。下游 `wj624/etf-lsi` 接入 ⑬国债曲线面板 + 邮件 5.3 小节 |
+| 2026-11-04 | `deploy.yml` 冒烟覆盖 13 个 check（以 `deploy.yml` 的 check 列表为准） |
 
 ---
 

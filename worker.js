@@ -35,14 +35,15 @@ const MAX_CHUNK = 1200; // 单次向腾讯请求的最大条数（分页用）
 
 // ── 工具 ────────────────────────────────────────────────────────
 function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Access-Control-Allow-Origin": "*",
-      "Cache-Control": "public, max-age=300",
-    },
-  });
+  const headers = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+  // 错误响应绝不进公开缓存；字段名 / 单位契约保持不变
+  headers["Cache-Control"] = status === 200 ? "public, max-age=300" : "no-store";
+  return new Response(JSON.stringify(data), { status, headers });
 }
 
 // 将 20260101 / 2026-01-01 之类统一成 YYYY-MM-DD
@@ -68,9 +69,7 @@ async function tencentKlineChunk(symbol, period, start, end, count) {
   for (const host of KLINE_HOSTS) {
     try {
       const url = `${host}/appstock/app/kline/kline?param=${encodeURIComponent(param)}`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/" },
-      });
+      const res = await gfetch(url, { "User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/" }, 15000);
       if (!res.ok) throw new Error("HTTP " + res.status);
       const j = await res.json();
       if (j.code !== 0) throw new Error("code " + j.code);
@@ -120,9 +119,7 @@ async function fetchKlineFull(symbol, period, start, end) {
 async function fetchCsindex(symbol, start, end) {
   const url = `${CSINDEX_URL}?indexCode=${encodeURIComponent(symbol)}&startDate=${encodeURIComponent(start)}&endDate=${encodeURIComponent(end)}`;
   try {
-    const res = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.csindex.com.cn/" },
-    });
+    const res = await gfetch(url, { "User-Agent": "Mozilla/5.0", "Referer": "https://www.csindex.com.cn/" }, 15000);
     if (!res.ok) throw new Error("HTTP " + res.status);
     const j = await res.json();
     const list = (j && (j.data || j.list)) || [];
@@ -1183,6 +1180,17 @@ async function fetchMacroRatios() {
 // ── 主路由 ─────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
+   if (request.method === "OPTIONS") {
+     return new Response(null, {
+       status: 204,
+       headers: {
+         "Access-Control-Allow-Origin": "*",
+         "Access-Control-Allow-Methods": "GET, OPTIONS",
+         "Access-Control-Allow-Headers": "Content-Type",
+         "Access-Control-Max-Age": "86400",
+       },
+     });
+   }
    try {
     const url = new URL(request.url);
 
@@ -1191,7 +1199,7 @@ export default {
       const symbol = (url.searchParams.get("symbol") || "sz399006").toLowerCase();
       const period = url.searchParams.get("period") || "day";
       const start = url.searchParams.get("start") || "2015-01-01";
-      const end = new Date().toISOString().slice(0, 10);
+      const end = bjToday();
       const key = `kline:${symbol}:${period}:${start}:${end}`;
 
       try {
@@ -1218,7 +1226,7 @@ export default {
     if (url.pathname === "/api/csindex") {
       const symbol = (url.searchParams.get("symbol") || "H30269").toUpperCase();
       const start = url.searchParams.get("start") || "20100101";
-      const end = url.searchParams.get("end") || new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      const end = url.searchParams.get("end") || bjToday().replace(/-/g, "");
       const key = `csindex:${symbol}:${start}:${end}`;
 
       try {
@@ -1243,7 +1251,7 @@ export default {
     // /api/etf-shares?exchange=SZ&date=2026-09-18&code=510300
     if (url.pathname === "/api/etf-shares") {
       const exchange = (url.searchParams.get("exchange") || "ALL").toUpperCase();
-      const date = url.searchParams.get("date") || new Date().toISOString().slice(0, 10);
+      const date = url.searchParams.get("date") || bjToday();
       const code = (url.searchParams.get("code") || "").replace(/[^0-9]/g, "");
       const key = `etfshares:${exchange}:${date}:${code}`;
       try {
@@ -1370,7 +1378,7 @@ export default {
     // /api/trade-calendar?start=2010-01-01&end=2026-12-31
     if (url.pathname === "/api/trade-calendar") {
       const start = url.searchParams.get("start") || "2010-01-01";
-      const end = url.searchParams.get("end") || new Date().toISOString().slice(0, 10);
+      const end = url.searchParams.get("end") || bjToday();
       const key = `cal:${start}:${end}`;
       try {
         const cached = await env.CACHE.get(key);
@@ -1766,7 +1774,7 @@ export default {
         "cn-liquidity": "/api/cn-liquidity?days=60  (SHIBOR 八期限 + DR001/DR007/DR014，单位 %)",
         "etf-premium": "/api/etf-premium?codes=510300,159919  (折溢价率 %，附 stale 标记)",
         "market-breadth": "/api/market-breadth  (涨跌家数/涨停跌停/连板高度，仅当日)",
-        "cn-rates": "/api/cn-rates?days=250  (国债 2/5/10/30Y 曲线 + 期限利差 bp，尾部窗口)",
+        "cn-rates": "/api/cn-rates?days=250  (国债 2/5/10/30Y 曲线 + 期限利差 %（×100 为 bp），尾部窗口)",
         "commodity-quote": "/api/commodity-quote?symbols=AU0,AG0,SC0,GC,SI,CL,OIL  (沪金/沪银/SC原油 + 纽约金银/WTI/布伦特)",
         "futures-kline": "/api/futures-kline?symbol=AU0&days=250  (期货主力连续日K)",
         "sge-spot": "/api/sge-spot?instrument=Au99.99&days=250  (上金所黄金/白银现货日线)",

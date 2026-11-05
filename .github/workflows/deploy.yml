@@ -14,7 +14,7 @@ jobs:
         with:
           node-version: "20"
           package-manager-cache: false
-      - run: npm install -g wrangler
+      - run: npm install -g wrangler@4
       - name: Deploy
         run: wrangler deploy
         env:
@@ -61,7 +61,7 @@ jobs:
           check "cn-liquidity"    "/api/cn-liquidity?days=10"                           '"dr007":'
           check "etf-premium"     "/api/etf-premium?codes=510300,159919"                '"premium_pct":'
           check "market-breadth"  "/api/market-breadth"                                 '"total":'
-          check "cn-rates"       "/api/cn-rates?days=30"                               '"cn_10y":'
+          check "cn-rates"       "/api/cn-rates?days=30"                               '"count":'
           check "market-turnover" "/api/market-turnover"                                '"total_amount":'
           check "commodity-quote" "/api/commodity-quote"                                  '"count":7'
           check "futures-kline"   "/api/futures-kline?symbol=AU0&days=30"                  '"count":30'
