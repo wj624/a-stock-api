@@ -735,3 +735,117 @@ requests.post(
 ## License
 
 Apache-2.0。见 [LICENSE](./LICENSE)。取数逻辑改编自 [simonlin1212/a-stock-data](https://github.com/simonlin1212/a-stock-data)（Apache-2.0）。
+
+---
+
+## 附录 · 2026-11-05 全量整改记录（给维护者 / 给 AI 读）
+
+> **这一节是什么**：AI 维护助手在 2026-11-05 对账号下 6 个仓库做完一次「大范围彻底修复」后追加的说明。目的只有一个——**让下一次维护（不管人或 AI）能看懂每个改动为什么做、哪些绝对不能回退**。
+>
+> **怎么读**：改任何代码之前，先读本 README 前文的「维护须知 / 铁律 / 给 AI 的维护提示词」，再读本附录。**两者冲突时以前文铁律为准**；本附录只解释本次改动，不新增、不覆盖任何设计口径。
+>
+> **本次原则**：用户要求「稳定、基本无维护、占用空间少、不自动生成垃圾」，并明确「修改前先看 README 的设计思路与维护须知」。因此本次只修**确定性 bug、静默失败、危险工作流行为、文档与代码不一致、依赖版本失控、运行时垃圾文件**；**没有做架构改造，没有删任何数据资产，没有改任何口径/阈值/单位/cron/构建顺序**。
+>
+> **本次改动范围**：6 仓共 40 个文件、0 删除；逐仓白名单精确提交，全程无 `--force`、无 rebase 冲突。**上线后的串行补测又追加了一次 pandas 3.x 兼容性修复（3 仓 6 文件，见 F 节），所以最终线上状态以 F 节为准，A 表里凡是写 `pandas<4` 的地方都已收紧为 `pandas<3`**。
+
+### A. 本次改了什么（逐文件）
+
+| 文件 | 原始缺陷（为什么必须改） | 本次修法 | 依据 / 约束 |
+|---|---|---|---|
+| `worker.js`（9 处） | 错误响应仍带 `public, max-age=300`，错误可能被 CDN 缓存；缺 CORS `Allow-Methods` / `Allow-Headers`；无 `OPTIONS` 预检；2 处裸 `fetch` 无超时会挂死；4 处默认日期用 UTC `toISOString().slice(0,10)`，北京时间凌晨会取到前一天 | 错误响应改 `Cache-Control: no-store`；成功响应补 `Access-Control-Allow-Methods: GET, OPTIONS` 与 `Allow-Headers: Content-Type`；`fetch()` 入口处理 `OPTIONS` 返回 204；裸 fetch 改带超时的 `gfetch(url, headers, 15000)`；默认日期改 `bjToday()`；根索引 `cn-rates` 文案由「利差 bp」改为「期限利差 %（×100 为 bp）」 | §0 铁律「响应结构是契约」「空结果不写 KV」「凭证不进代码」；§3 单位与口径约定 |
+| `.github/workflows/deploy.yml`（2 处） | `cn-rates` 冒烟检查 `'"cn_10y":'`，但响应里并无该字段，会误判；`npm install -g wrangler` 无版本上界，未来主版本可能破坏部署 | 冒烟改验真实字段 `'"count":'`；锁 `wrangler@4` | §8 部署与凭证；部署后 13 个冒烟是唯一线上验收 |
+| `README.md` | 账号名 `jw624` 拼错；缺 5 个端点契约与对应 TTL 行；下游消费者表缺 `/api/macro-ratios`；冒烟数量与行数/体积等数字过时 | 订正为 `wj624`；补 `commodity-quote` / `futures-kline` / `sge-spot` / `global-index` / `macro-ratios` 契约与 §9 TTL；补下游表；过时数字改定性描述 | §2 端点契约、§9 TTL 一览、§11 下游消费者 |
+| `.gitignore`（新建） | 原本没有忽略规则，`node_modules/`、`.dev.vars`、`.wrangler/`、`*.log`、`__pycache__/` 会污染工作区 | 新建，只忽略运行时/本地产物 | 用户四原则「不自动生成垃圾」 |
+
+### B. 本次坚决没改（硬约束，改了就是破坏设计）
+
+- **响应字段名、单位、日期格式一律未改**（§0 / §2 / §3 是对下游的契约）。
+- **「空结果不写 KV 缓存」与 `shouldCacheDate` 历史日期写配额未改**（§9 铁律）。
+- **`cn_10y_2y` 等期限利差单位是 `%`，`×100` 才是 bp** —— 本次只改文案，未改数值口径。
+- KV 命名空间绑定、`wrangler.toml`、凭证纪律（§8）未改。
+- **`wrangler.toml` 的 `compatibility_date = "2026-01-01"` 是未来日期，本次特意未动**：改它会引入 Cloudflare Workers 运行时行为变化，需单独评估后再决定。
+
+### C. 明令作废的旧建议（别再走回头路）
+
+第一轮「只读体检报告」里提出过若干架构建议，**读完各仓 README 的维护须知后已全部作废**，本次一个都没采纳：
+
+- ❌ **「产物不入库 / 数据与页面不进 git」**：本仓产物是 Pages / EdgeOne Pages / GAS 的**数据源本身**，从仓库检出，必须入库。
+- ❌ **「删 `cache/` / 改回 `actions/cache`」**：`cache/` 是断网降级与历史累积的命根子。
+- ❌ **「删数据资产 / 删摘要文件 / 清理 `echarts.min.js` / 删 `akshare` / 删 `westock-data`」**：均被 README 明确点名保护。
+- ❌ **「把 `except: pass` 全改抛错」**：局部容错（TTL 状态、日志编码、临时文件清理、上游回退链）是设计，不是缺陷；本次只把**主流程**的静默失败改成显式失败。
+- ❌ 早期报告曾把 GAS 脚本里的 `RECEIVER_EMAIL` 硬编码列为 bug —— **不是 bug**，它是 `CONFIG` 里明确列出的默认配置项，本次未改。
+
+> 若下次 AI 读到 `wj624-仓库体检与整改思路.md` 或 `wj624-整改落地手册.md` 里的 P1/P2 建议，请以本附录为准：**那两份是整改前的中间产物，已作废**。
+
+
+### D. 给 AI 的维护边界（可复制这段）
+
+```
+你在维护 wj624/a-stock-api（多个看板共用的只读代理）。动手前：
+1. 先读 README §0 铁律、§2 端点契约、§3 单位与口径、§9 缓存策略，再读本附录。
+2. 本附录 A 表的 9+2 处修复是 2026-11-05 已完成的事项，别当新问题重复改，也别回退。
+3. 绝对不要：改响应字段名/单位/日期格式；让空结果写进 KV；把凭证写进代码；用 force push。
+4. 只做「代理」，不做「功能扩张」；新增端点必须同步 §2 契约、§9 TTL、§11 下游表、deploy.yml 冒烟。
+5. 改完必须：node --check worker.js；push 后确认 Deploy to Cloudflare Workers 的 13 个冒烟全绿。
+6. 线上写操作：精确 git add、中文 commit、git pull --rebase、绝不 force。
+```
+### E. 验证与回滚
+
+| 项目 | 说明 |
+|---|---|
+| 本地验证 | 补丁脚本在从原仓库 `git archive HEAD` 导出的**干净副本**上端到端重跑：59/59 替换、2 处追加、2 个新建 `.gitignore`、5 个 `monthly-snapshot.yml` 降级；`.py` 用 `ast.parse`、`worker.js` 用 `node --check`、`.yml` 用 `yaml.safe_load`，语法自检 26 项全 PASS |
+| README 硬约束复核 | 61 项，实际 61/61 通过（初检 5 项 FAIL 均为检查规则误报） |
+| 线上内容核验 | GitHub API 独立核验：commit 主题、变更文件集合与白名单逐仓一致、**0 删除**、关键修复内容、数据资产 12/12 在线 |
+| 线上实测 | 2026-11-05 串行手动触发 4 个核心 workflow 并逐个核验：4/4 全部 success、每仓产物 commit 均 removed=0、关键数据资产完好。第一次补测在 rotation-monitor 暴露 pandas 3.x 移除 resample('M') 的问题，双保险修复后重跑通过。明细与最终线上 HEAD 见下方「F. 补测实测记录」 |
+| 令牌 / 垃圾 | 交付文件 `ghp_` / `github_pat_` 0 命中；仓库内不生成 `__pycache__` |
+
+**回滚**：优先 `git revert <整改 commit>` 生成反向 commit 再 push（保留历史、无需 force）。整改前基线 `5eb3e36`，整改 commit `daea02ad`（`git revert daea02ad`）。本次整改 commit 由 `push` 触发 `Deploy to Cloudflare Workers`，**已 `success`**，等于线上跑通 Worker 部署 + 13 个冒烟 + `OPTIONS` 预检 + `no-store` 头。
+
+**下次改代码前的三行自检**（沿用前文铁律）：
+1. 这个文件是源码还是产物？产物只能靠重跑生成，不能手改。
+2. 改动会不会破坏「数据资产 / 口径 / 阈值 / 单位 / cron / 构建顺序」？会就停手。
+3. 改完要跑什么验证、要同步 README 哪几节？写进 commit body。
+
+### F. 补测实测记录（2026-11-05，含 pandas 3.x 兼容性二次修复）
+
+整改 commit 上线后，用户要求对 4 个「`push` 不触发、只在 `schedule` / `workflow_dispatch` 跑」的核心抓数流水线做**串行手动触发补测**：一个跑完、核验通过，再触发下一个，避免并发写 `main` 冲突。
+
+**第一次补测在 `rotation-monitor` 失败**，日志关键行：
+
+```
+ValueError: 'M' is no longer supported for offsets. Please use 'ME' instead.
+  File ".github/workflows/generate_page.py", line 130, in ...
+    monthly = bd.set_index('date')['close_cyb'].resample('M').last()
+```
+
+根因：pandas 3.1.1 于 2026-11-04 发布，移除了 `resample('M')` 别名，并默认开启 Copy-on-Write、改变字符串 dtype。**整改前依赖本无上界**；本轮整改把上界写成 `<4` 过宽，且 `daily_update.yml` 的 `pip install` 行仍是完全无上界 —— 这是策略失误，已按下面「双保险」纠正。
+
+**双保险修复（3 仓 6 文件）**：
+
+1. **代码**：`rotation-monitor/.github/workflows/generate_page.py` 的 `resample('M')` → `resample('ME')`（pandas 2.3.3 与 3.0.0 下语义一致，均为月末重采样，本地实测两种版本输出一致）。
+2. **依赖**：所有 pandas 约束收紧为 `<3`，且 **`requirements.txt` 与 workflow 的 `pip install` 行两处同步** —— 线上实际执行的是 workflow 里的 pip install，不是 requirements.txt，只改一处等于没改。
+3. **二次 commit**：`rotation-monitor` `ee80a439`、`earl-etf-dashboard` `af8b5237`、`national-team-etf-flow` `b0ef1c6c`。
+
+**修复后重跑，4/4 全部通过**：
+
+| 仓库 / workflow | run id | 结论 | 产物 commit（前 → 后） | 删除 | 关键资产 |
+|---|---|---|---|---|---|
+| `rotation-monitor` / `daily_update.yml` | 41990306988 | success | `ee80a439` → `1c6dd808` | 0 | `public/index.html` 完好 |
+| `us-world-economy-dashboard` / `update.yml` | 41990418511 | success | `e9ee6da9` → `0b18f069` | 0 | `cache/` · `index.html` · `llms.txt` · `snapshot.md` · `version.txt` 完好 |
+| `earl-etf-dashboard` / `update.yml` | 41990472730 | success | `af8b5237` → `abdee20d` | 0 | `cache/` · `version.txt` · `llms.txt` · `latest.json` · `index.html` 完好 |
+| `national-team-etf-flow` / `daily-refresh.yml` | 41990810766 | success | `b0ef1c6c` → `5110f0f1` | 0 | `_etf_shares_cache.json` · `echarts.min.js` · `index.html` 完好 |
+
+> `a-stock-api`（Worker 部署 + 13 个冒烟端点）与 `etf-lsi`（daily report）由 `push` 触发，整改当时即 `success`，不在上表。
+
+**写本附录时各仓 `main` 的线上实况**（均为短 SHA，位数不影响定位）：
+
+| 仓库 | 整改 commit | pandas 二次修复 | 补测产物 / 当前 HEAD |
+|---|---|---|---|
+| `a-stock-api` | `daea02a` | — | `daea02a` |
+| `us-world-economy-dashboard` | `e9ee6da` | — | `0b18f06` |
+| `earl-etf-dashboard` | `75255bd` | `af8b523` | `abdee20` |
+| `national-team-etf-flow` | `016a401` | `b0ef1c6` | `5110f0f` |
+| `rotation-monitor` | `b5f01af` | `ee80a43` | `1c6dd80` |
+| `etf-lsi` | `606958f` | — | `8e8f74f`（自动产物 commit 会继续前移，属正常） |
+
+> **给 AI 的硬约束**：这 3 个仓的 pandas **必须锁 `<3`**，不要「简化」成 `<4` 或去掉上界；`resample('ME')` 不要改回 `'M'`。改依赖时**必须同时改 `requirements.txt` 和 workflow 的 `pip install` 行** —— 第一次补测就是这样崩的。另外这 6 仓**没有单元测试套件**，上述「实测」指真实 workflow 执行 + 产物核验，改完代码仍应手动 dispatch 一次确认。
