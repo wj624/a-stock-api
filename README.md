@@ -180,12 +180,12 @@
 上游中国货币网两个 form-urlencoded POST：`ShiborHis`（八期限）+ `FrrHis`（回购定盘）。
 
 返回 `latest`（最新一天）、`derived`（派生指标，单位 bp）、`data`（按日期升序的序列）。字段含义写在响应的 `fields` 里。
-**`FDR001/007/014` 就是 DR001/DR007/DR014**（存款类机构质押式回购定盘利率），DR007 是央行公开市场操作实际盯的锚。
+**`FDR001/007/014` 就是 DR001/DR007/DR014**（存款类机构质押式回购定盘利率）。**2026-11-02 换锚后**，主要政策利率为隔夜逆回购操作利率、央行调控目标为 **DR001**；DR007 退居辅助参考，不再是「实际盯的锚」。
 
 | 关键限制 | 说明 |
 |---|---|
-| `FrrHis` 忽略 `startDate` | 永远只回最近约 **21 个交易日**，而 SHIBOR 能给 60+ 天。下游若把两者画一张图，左侧会出现「只有 SHIBOR、没有 DR007」的空白，需从首个 DR007 有效点起画 |
-| 没有 OMO | 央行公开市场操作（净投放/回笼）的公开无 Key 接口未找到，暂不提供。资金面松紧用 DR007 相对 20 日均线的偏离代替 |
+| `FrrHis` 忽略 `startDate` | 永远只回最近约 **21 个交易日**，而 SHIBOR 能给 60+ 天。下游若把两者画一张图，左侧会出现「只有 SHIBOR、没有 DR 曲线」的空白，需从首个 DR001/DR007 有效点起画并标注数据起点 |
+| 没有 OMO | 央行公开市场操作（净投放/回笼）的公开无 Key 接口未找到，暂不提供。资金面松紧用 `derived.dr007_vs_ma20_bp`（DR007 相对 20 日均线）表达；下游 etf-lsi ⑨ 另用 `dr001` 自算 20 日中枢与偏离，Worker 不提供政策利率字段 |
 
 ### `GET /api/etf-premium` — ETF 折溢价率
 
@@ -695,7 +695,7 @@ requests.post(
 |---|---|---|
 | `wj624/rotation-monitor` | `kline` / `csindex` | K 线字段名与日期格式（`date/open/close/high/low/volume`） |
 | `wj624/national-team-etf-flow` | `etf-shares`(SH, SZ→仓库内直连) / `fund-nav` / `trade-calendar` | `shares_10k` 单位、`nav` 时区 |
-| `wj624/etf-lsi` | `etf-shares`(SH) / `fund-nav` / `trade-calendar` / **`index-valuation` / `cn-liquidity` / `etf-premium` / `market-breadth` / `cn-rates`** / `macro-ratios` | 同上；且它按「空表必须复核」的语义写的，别把 `upstream_error` 去掉。这 5 个新端点支撑看板 ⑨⑩⑪⑫⑬ 与邮件 ⑤ 板块——**任何一个失败都只让对应面板消失**，不会中断它整轮流水线 |
+| `wj624/etf-lsi` | `etf-shares`(SH) / `fund-nav` / `trade-calendar` / **`index-valuation` / `cn-liquidity` / `etf-premium` / `market-breadth` / `cn-rates`** / `macro-ratios` | 同上；且它按「空表必须复核」的语义写的，别把 `upstream_error` 去掉。这 5 个新端点支撑看板 ⑨⑩⑪⑫⑬ 与邮件 ⑤ 板块——**任何一个失败都只让对应面板消失**，不会中断它整轮流水线；⑨ 依赖 `dr001/fr001/shibor_on/shibor_3m` 字段与 % 单位，**中枢由下游自算，Worker 无需提供政策利率字段**（§0「只做代理」） |
 | `wj624/earl-etf-dashboard` | 计划接入 bond-yield / margin-account / market-turnover | 尚未迁移，字段可协商 |
 
 > `national-team-etf-flow` 与 `etf-lsi` 都**只依赖 Worker、或 Worker + 直连双通道**，没有第三层兜底。任何"看起来无害"的空值语义改动，都会直接变成它们的静默数据缺口。
@@ -708,7 +708,7 @@ requests.post(
 |---|---|
 | ~~`/api/index-valuation`~~ | **已实现（2026-11）**：legulegu 走不通（阿里云反爬 `acw_tc` + 401），中证官网估值页改版后接口全 404，最终改用**蛋卷基金** `danjuanfunds.com/djapi/index_eva/detail/{code}`，免 Key、含 PE/PB 双分位 + ROE + 股息率。原「做不到」的结论已作废 |
 | 指数估值的**历史序列** | 蛋卷只给「最新一天 + 一条周频 PE 曲线（`pe_history`）」。要日频历史 PE/PB 曲线仍需付费源，暂不提供；当前靠 `pe_pct` 分位本身已能回答「现在贵不贵」 |
-| 央行公开市场操作（OMO 净投放） | 中国货币网的 OMO 接口路径未找到（试过 8 个候选全 404），央行官网只有 HTML/PDF 公告。资金面松紧改用 DR007 相对 20 日均线的偏离表达 |
+| 央行公开市场操作（OMO 净投放） | 中国货币网的 OMO 接口路径未找到（试过 8 个候选全 404），央行官网只有 HTML/PDF 公告。资金面松紧用 `derived.dr007_vs_ma20_bp` 表达（下游 ⑨ 另用 dr001 自算中枢） |
 | `/api/spot`（全市场逐股快照） | 东财 push2 强制 100 条/页，全市场 5900+ 只需 60 页，超出免费 Worker 单请求子请求上限。成交额需求请用 `/api/market-turnover` |
 | `/api/etf-shares` 深交所**历史** | 深交所 `fund.szse.cn` 只给当前快照；历史需走 `www.szse.cn/api/report/ShowReport?...CATALOGID=scsj_fund_jjgm` 的 **xlsx**（`SHOWTYPE=JSON` 返回 500）。Worker 里解析 xlsx 不稳，已改由各仓库**自行直连解析**（`national-team-etf-flow` / `etf-lsi` 均如此） |
 
@@ -729,6 +729,7 @@ requests.post(
 | 2026-11-04 | 首批下游接入：`wj624/etf-lsi` 新增 ⑨境内资金面 ⑩市场宽度 ⑪指数估值 ⑫ETF折溢价 四个看板面板 |
 | 2026-11-04 | **新增 `/api/cn-rates`**（累计端点数以 §2 为准）：`bond-yield` 的轻量版——只回尾部窗口（数据量远小于同期全量）、剔除上游「只有日期、各期限全 null」的占位行、派生 `cn_5y_2y` / `cn_30y_10y` 与 bp 口径的变化量。下游 `wj624/etf-lsi` 接入 ⑬国债曲线面板 + 邮件 5.3 小节 |
 | 2026-11-04 | `deploy.yml` 冒烟覆盖 13 个 check（以 `deploy.yml` 的 check 列表为准） |
+| 2026-11-10 | 订正 11-02 换锚后的口径：主要政策利率为隔夜逆回购、调控目标为 DR001，DR007 退居辅助；明确 etf-lsi ⑨ 的 20 日中枢由下游自算，本 Worker 不新增政策利率字段（只做代理） |
 
 ---
 
