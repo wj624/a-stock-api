@@ -702,6 +702,48 @@ requests.post(
 
 ---
 
+### 11.1 接入鉴权（2026-11-14 起，新仓库必读）
+
+**`/api/*` 已强制校验 `X-API-Key`**；根路径 `/` 索引页与 `OPTIONS` 预检仍公开。目的是防止公开仓库被 fork 后白嫖 Worker 配额、加剧上交所对 Cloudflare 共享出口 IP 的限流。
+
+密钥有两份、值必须一致：
+
+| 位置 | 名称 | 数量 | 说明 |
+|---|---|---|---|
+| Cloudflare Workers Secret | `API_KEY` | 账号级 1 份 | Worker 端校验用，**不在仓库里** |
+| GitHub Actions Secret | `A_STOCK_API_KEY` | 每个仓库 1 份 | 下游 workflow 注入环境变量 |
+
+**新仓库接入 3 步（密钥绝不写进代码或提交历史）**：
+
+1. 仓库 `Settings → Secrets and variables → Actions → New repository secret`，名称必须 `A_STOCK_API_KEY`，值填密钥。**fork 不复制 Secrets**，所以公开仓库也不会泄漏。
+2. workflow 的 job 下加：
+
+   ```yaml
+   env:
+     A_STOCK_API_KEY: ${{ secrets.A_STOCK_API_KEY }}
+   ```
+
+3. 代码里所有发往本 Worker 的请求带 header：
+
+   ```python
+   def _worker_headers(extra=None):
+       h = dict(extra or {})
+       k = os.environ.get("A_STOCK_API_KEY", "")
+       if k:
+           h["X-API-Key"] = k
+       return h
+   ```
+
+   只加给 `API_BASE`（本 Worker）的请求；**直连腾讯 / 东财 / 中证 / 深交所的请求不要带**，不要把密钥发给第三方。
+
+**排障**：返回 401 = 该仓库没配 Secret、workflow 没注入 env、或代码没带 header。`deploy.yml` 部署后的 13 项冒烟已带 header，可作自检基准：13/13 PASS 说明密钥链路通。
+
+**轮换**：同时改 Cloudflare `API_KEY` 与所有下游仓库的 `A_STOCK_API_KEY`，值必须一致；只改一边会全量 401。改完看一次冒烟结果。
+
+当前已接入的调用方：`wj624/{etf-lsi, rotation-monitor, national-team-etf-flow, earl-etf-dashboard, a-stock-api}` 与 `wj402041069-del/{a-share-market-breadth, us-qdii-premium}`；两个账号下全部 10 个仓库均已预置 Secret。
+
+---
+
 ## 12. 已知未实现（及原因，别重复尝试）
 
 | 端点 | 为什么不提供 |
@@ -730,6 +772,7 @@ requests.post(
 | 2026-11-04 | **新增 `/api/cn-rates`**（累计端点数以 §2 为准）：`bond-yield` 的轻量版——只回尾部窗口（数据量远小于同期全量）、剔除上游「只有日期、各期限全 null」的占位行、派生 `cn_5y_2y` / `cn_30y_10y` 与 bp 口径的变化量。下游 `wj624/etf-lsi` 接入 ⑬国债曲线面板 + 邮件 5.3 小节 |
 | 2026-11-04 | `deploy.yml` 冒烟覆盖 13 个 check（以 `deploy.yml` 的 check 列表为准） |
 | 2026-11-10 | 订正 11-02 换锚后的口径：主要政策利率为隔夜逆回购、调控目标为 DR001，DR007 退居辅助；明确 etf-lsi ⑨ 的 20 日中枢由下游自算，本 Worker 不新增政策利率字段（只做代理） |
+| 2026-11-14 | /api/* 强制校验 X-API-Key（放行 / 与 OPTIONS）；两个账号共 10 个仓库预置 A_STOCK_API_KEY，下游代码与部署冒烟同步携带 header，13/13 PASS |
 
 ---
 
