@@ -39,7 +39,7 @@ function json(data, status = 200) {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
   };
   // 错误响应绝不进公开缓存；字段名 / 单位契约保持不变
   headers["Cache-Control"] = status === 200 ? "public, max-age=300" : "no-store";
@@ -1186,13 +1186,17 @@ export default {
        headers: {
          "Access-Control-Allow-Origin": "*",
          "Access-Control-Allow-Methods": "GET, OPTIONS",
-         "Access-Control-Allow-Headers": "Content-Type",
+         "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
          "Access-Control-Max-Age": "86400",
        },
      });
    }
    try {
     const url = new URL(request.url);
+    // 只允许持有密钥的本人仓库调用；fork 不继承 GitHub Secrets，其请求会被拒
+    if (url.pathname !== "/" && request.headers.get("X-API-Key") !== env.API_KEY) {
+      return json({ error: "unauthorized", message: "X-API-Key required" }, 401);
+    }
 
     // /api/kline?symbol=sz399006&start=2010-01-01
     if (url.pathname === "/api/kline") {
