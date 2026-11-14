@@ -28,6 +28,8 @@ jobs:
       - name: Smoke test（部署后自检）
         if: success()
         continue-on-error: true
+        env:
+          A_STOCK_API_KEY: ${{ secrets.A_STOCK_API_KEY }}
         run: |
           BASE="https://a-stock-api.wj4020410.workers.dev"
           SUMMARY="$GITHUB_STEP_SUMMARY"
@@ -38,7 +40,7 @@ jobs:
           check() {
             name="$1"; path="$2"; expect="$3"
             t0=$(date +%s)
-            body=$(curl -sS --max-time 45 "$BASE$path" 2>/dev/null || true)
+            body=$(curl -sS --max-time 45 -H "X-API-Key: $A_STOCK_API_KEY" "$BASE$path" 2>/dev/null || true)
             t1=$(date +%s)
             if printf '%s' "$body" | grep -q -- "$expect"; then
               mark="PASS"
