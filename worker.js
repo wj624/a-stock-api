@@ -539,6 +539,10 @@ const DJ_HEADERS = {
 
 function djIndexCode(raw) {
   const s = String(raw || "").trim().toUpperCase();
+  // 蛋卷支持的非交易所6位代码（港股/中证自定义/海外指数）：精确白名单，不放宽正则。
+  // 这些代码走 fetchIndexValuation -> detail/{code}，字段结构与 A 股指数完全一致（已实测）。
+  const DJ_EXTRA = ["HKHSTECH", "CSIH30269", "NDX", "SP500"];
+  if (DJ_EXTRA.includes(s)) return s;
   if (/^(SH|SZ|BJ)\d{6}$/.test(s)) return s;
   const d = s.replace(/[^0-9]/g, "");
   if (d.length !== 6) return "";
