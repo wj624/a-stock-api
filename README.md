@@ -966,3 +966,14 @@ ValueError: 'M' is no longer supported for offsets. Please use 'ME' instead.
 不方便或不想打赏也**完全没关系**：点个 ⭐ Star、提个 issue、把链接转给可能用得上的人，都是很实在的支持。发现数据或文案有问题也欢迎直接指出，我会按 README 里的维护纪律逐条核对。
 
 谢谢你的时间。愿数据常新，愿你我都不被行情牵着走。🙏
+
+## 2026-11-22 · index-valuation 放行 4 个非 A 股指数代码
+
+- **改动**：`djIndexCode()` 加精确白名单 `DJ_EXTRA = ["HKHSTECH", "CSIH30269", "NDX", "SP500"]`，仅这 4 个代码放行。
+- **原因**：原函数只接受 `^(SH|SZ|BJ)\d{6}$` 或 6 位数字，这 4 个蛋卷支持的代码被 `.filter(Boolean)` 静默丢弃（不报错、只是不返回），导致调用方以为上游没数据。
+- **验证**：蛋卷 `/djapi/index_eva/detail/{code}` 对这 4 个均返回完整 PE/PB 双分位；本地单测 13 例全过（新代码放行、A 股行为不变、垃圾输入仍拒）；node --check 通过。
+- **影响面**：只作用于 `/api/index-valuation`；其他端点各用各的代码逻辑，不受影响。
+- **部署**：commit `5a343398a32`，deploy run `44923107444` success + smoke test PASS。
+- **回滚**：`git revert 5a343398a32`，push 后自动重新部署。
+- **保密**：`A_STOCK_API_KEY` 始终从 GitHub Secrets 读、经 `X-API-Key` 头传递，未写进代码或仓库文件。
+
