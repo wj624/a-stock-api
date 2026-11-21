@@ -529,6 +529,8 @@ async function mapLimit(items, limit, fn) {
 // 这是 legulegu（对被墙/401）与中证官网（估值页已改版、接口 404）的替代源。
 // 字段口径：pe_pct = 0~1，越大越贵；pe_over_history 是它的互补值（1 - pe_pct），
 // 两者互为倒数关系，下游统一只用 pe_pct，避免一个指标两种读法。
+// valuation_from = 蛋卷 begin_at（分位样本起点），与 date（ts，样本终点/数据日）
+// 共同构成「分位区间」；不同指数起点不同，不能一概写成固定 10 年。
 const DJ_EVA_URL = "https://danjuanfunds.com/djapi/index_eva/detail/";
 const DJ_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -566,6 +568,7 @@ async function fetchIndexValuation(codes) {
         index_code: d.index_code || c,
         name: d.name || "",
         date: d.ts ? bjDate(d.ts) : "",
+        valuation_from: d.begin_at ? bjDate(d.begin_at) : "",
         pe: num(d.pe),
         pb: num(d.pb),
         pe_pct: num(d.pe_percentile),
