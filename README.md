@@ -977,3 +977,13 @@ ValueError: 'M' is no longer supported for offsets. Please use 'ME' instead.
 - **回滚**：`git revert 5a343398a32`，push 后自动重新部署。
 - **保密**：`A_STOCK_API_KEY` 始终从 GitHub Secrets 读、经 `X-API-Key` 头传递，未写进代码或仓库文件。
 
+## 2026-11-22 · index-valuation 新增 valuation_from（分位样本起点）
+
+- **改动**：`fetchIndexValuation()` 在返回行里增加 `valuation_from: d.begin_at ? bjDate(d.begin_at) : ""`，与已有 `date`（来自 `d.ts`）共同构成 PE/PB 分位样本的真实起止区间。
+- **原因**：蛋卷 `detail/{code}` 一直返回 `begin_at`，但 Worker 原来只映射 `ts`，下游只能看到数据日，看不到分位区间；不同指数起点差异很大（沪深300 等 2016-08-05 起、科创50 2019-12-31 起、恒生科技 2020-07-27 起），不能笼统写成「10 年分位」。
+- **影响面**：只给 `/api/index-valuation` 的每行多一个字段；原有 `pe_pct/pb_pct/pe_over_history` 与 `date` 语义不变，不破坏既有调用方。
+- **验证**：`node --check` 通过；mock 单测确认 `SH000300 → 2016-08-05`、`HKHSTECH → 2020-07-27`，`date` 与分位字段映射不变。
+- **部署**：commit `a282201165c7`，deploy run `44930260294` success，Deploy 与 Smoke test 均 PASS。
+- **回滚**：`git revert a282201165c7`，push 后自动重新部署（约 1~2 分钟生效）。
+- **保密**：鉴权链路未动，`A_STOCK_API_KEY` 仍只从 GitHub Secrets 读、经 `X-API-Key` 头传递。
+
