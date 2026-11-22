@@ -60,6 +60,7 @@ jobs:
           check "help"            "/"                                                   "a-stock-api"
           check "etf-shares"      "/api/etf-shares?exchange=SH&date=$(date -d '-3 day' +%F)" '"unit":"shares_10k = 万份"'
           check "index-valuation" "/api/index-valuation?codes=SH000300,SZ399006"        '"pe":'
+          check "csindex-feature" "/api/csindex-feature?symbol=H30269"                   '"float_mv":'
           check "cn-liquidity"    "/api/cn-liquidity?days=10"                           '"dr007":'
           check "etf-premium"     "/api/etf-premium?codes=510300,159919"                '"premium_pct":'
           check "market-breadth"  "/api/market-breadth"                                 '"total":'
@@ -73,7 +74,7 @@ jobs:
 
           echo "" >> "$SUMMARY"
           if [ "$fail" -eq 0 ]; then
-            echo "全部 13 个端点通过。" >> "$SUMMARY"
+            echo "全部 14 个端点通过。" >> "$SUMMARY"
           else
             echo "**$fail 个端点失败**（详见上方日志的 \`--- body(head) ---\`）。" >> "$SUMMARY"
           fi

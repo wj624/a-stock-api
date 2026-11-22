@@ -66,6 +66,24 @@
 
 > 中证官网对指数基日（inception）当天的 `open/high/low/volume` 常为 `null`，属上游数据本身如此，与 akshare `stock_zh_index_hist_csindex` 行为一致。
 
+### `GET /api/csindex-feature` — 中证指数自由流通市值快照
+
+供 ETF 持仓背离看板做分母：中证官网「指数特征」页的 `calMkvSum`，即**指数自由流通市值**（单位亿元）。
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `symbol` / `code` | 中证指数代码（如 `H30269`，也接受 `csH30269`） | `H30269` |
+
+```json
+{ "symbol": "H30269", "count": 1,
+  "unit": { "float_mv": "元", "float_mv_yi": "亿元" },
+  "data": { "symbol": "H30269", "trade_date": "2026-11-20", "cons_num": 50,
+            "float_mv_yi": 44855.96, "float_mv": 4485596000000,
+            "source": "csindex.com.cn/indexInfo/index-feature" } }
+```
+
+> **口径警告**：这里是中证官方的「自由流通市值」，与 westock `quote` 的 `circulating_market_cap`（普通流通市值）不是同一口径，数值差异很大，**不要混用在同一分母里**。
+
 ### `GET /api/etf-shares` — ETF 份额（上交所历史 / 深交所当前快照）
 
 | 参数 | 说明 | 默认 |
@@ -986,4 +1004,15 @@ ValueError: 'M' is no longer supported for offsets. Please use 'ME' instead.
 - **部署**：commit `a282201165c7`，deploy run `44930260294` success，Deploy 与 Smoke test 均 PASS。
 - **回滚**：`git revert a282201165c7`，push 后自动重新部署（约 1~2 分钟生效）。
 - **保密**：鉴权链路未动，`A_STOCK_API_KEY` 仍只从 GitHub Secrets 读、经 `X-API-Key` 头传递。
+
+## 2026-11-22 · 新增 /api/csindex-feature（指数自由流通市值）
+
+- **改动**：新增 `CSINDEX_FEATURE_URL` + `fetchCsindexFeature()` + `/api/csindex-feature` 路由；返回中证官网 `indexInfo/index-feature/{code}` 的 `calMkvSum`，拆成 `float_mv_yi`（亿元）与 `float_mv`（元），附 `trade_date` 与 `cons_num`。
+- **原因**：`etf-lsi` 第三条赛道「红利低波」需要 `H30269` 的指数自由流通市值作分母；westock `quote csH30269` 的 `circulating_market_cap` 为 0，不能沿用普通宽基的取数方式。
+- **口径**：使用**中证官方自由流通市值**，与 westock 普通流通市值不是同一口径；下游必须在卡片文案里写明「自由流通市值」，不可与普通宽基混称。
+- **验证**：`node --check` 通过；本地用真实上游调用返回 `H30269 / 2026-11-20 / 44855.96 亿元 / 4,485,596,000,000 元`。
+- **影响面**：新增只读端点，既有 13 个端点行为不变；鉴权仍走 `X-API-Key === env.API_KEY`。
+- **部署**：push 触发自动部署；冒烟端点从 13 个增到 14 个（新增 `csindex-feature`）。
+- **回滚**：`git revert <commit>`，push 后自动重新部署。
+- **保密**：未写入任何密钥；`A_STOCK_API_KEY` 仍只从 Secrets 读。
 

@@ -30,6 +30,7 @@ const KLINE_HOSTS = [
   "https://qt.gtimg.cn",
 ];
 const CSINDEX_URL = "https://www.csindex.com.cn/csindex-home/perf/index-perf";
+const CSINDEX_FEATURE_URL = "https://www.csindex.com.cn/csindex-home/indexInfo/index-feature/";
 
 const MAX_CHUNK = 1200; // 单次向腾讯请求的最大条数（分页用）
 
@@ -150,6 +151,29 @@ async function fetchCsindex(symbol, start, end) {
       return null;
     }
   }
+
+// ── 中证指数官网「指数特征」：取指数自由流通市值（单位：亿元）──
+// 前端实测接口：/csindex-home/indexInfo/index-feature/{indexCode}
+// 返回 data.calMkvSum = 指数自由流通市值（亿元），tradeDate = 快照日期。
+async function fetchCsindexFeature(symbol) {
+  const url = CSINDEX_FEATURE_URL + encodeURIComponent(symbol);
+  const res = await gfetch(url, { "User-Agent": "Mozilla/5.0", "Referer": "https://www.csindex.com.cn/" }, 15000);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const j = await res.json();
+  if (String(j && j.code) !== "200") throw new Error("upstream code " + (j && j.code));
+  const d = j.data || {};
+  const raw = String(d.calMkvSum == null ? "" : d.calMkvSum).replace(/,/g, "").trim();
+  const yi = parseFloat(raw);
+  if (!Number.isFinite(yi) || yi <= 0) throw new Error("invalid calMkvSum");
+  return {
+    symbol,
+    trade_date: normDate(d.tradeDate),
+    cons_num: Number.isFinite(parseFloat(d.consNum)) ? parseFloat(d.consNum) : null,
+    float_mv_yi: yi,
+    float_mv: Math.round(yi * 1e8),
+    source: "csindex.com.cn/indexInfo/index-feature",
+  };
+}
 
 // ── 通用带超时的 fetch（避免上游卡死）─────────────────────────
 async function gfetch(url, headers, ms = 20000) {
@@ -1259,6 +1283,35 @@ export default {
       return json(payload);
     }
 
+    // /api/csindex-feature?symbol=H30269  (中证指数自由流通市值快照)
+    if (url.pathname === "/api/csindex-feature") {
+      let symbol = (url.searchParams.get("symbol") || url.searchParams.get("code") || "H30269").trim().toUpperCase();
+      symbol = symbol.replace(/^CS/, "");
+      if (!/^[0-9A-Z]{6,10}$/.test(symbol)) {
+        return json({ error: "bad_request", message: "symbol 格式不正确" }, 400);
+      }
+      const key = `csindexfeat:${symbol}`;
+      try {
+        const cached = await env.CACHE.get(key);
+        if (cached) return json({ ...JSON.parse(cached), cached: true });
+      } catch (_) { /* ignore */ }
+      try {
+        const feature = await fetchCsindexFeature(symbol);
+        const payload = {
+          symbol,
+          count: 1,
+          unit: { float_mv: "元", float_mv_yi: "亿元" },
+          note: "calMkvSum 来自中证指数官网指数特征页，口径为指数自由流通市值；与 westock 的 circulating_market_cap（流通市值）不是同一口径，勿混用。",
+          updated: Date.now(),
+          data: feature,
+        };
+        ctx.waitUntil(env.CACHE.put(key, JSON.stringify(payload), { expirationTtl: 3600 }).catch(() => {}));
+        return json(payload);
+      } catch (e) {
+        return json({ error: "csindex-feature fetch failed", symbol, message: String(e.message || e) }, 502);
+      }
+    }
+
     // /api/etf-shares?exchange=SZ&date=2026-09-18&code=510300
     if (url.pathname === "/api/etf-shares") {
       const exchange = (url.searchParams.get("exchange") || "ALL").toUpperCase();
@@ -1773,6 +1826,7 @@ export default {
       endpoints: {
         kline: "/api/kline?symbol=sz399006&start=2010-01-01",
         csindex: "/api/csindex?symbol=H30269&start=20160803",
+        "csindex-feature": "/api/csindex-feature?symbol=H30269  (指数自由流通市值快照，float_mv 单位元)",
         "etf-shares": "/api/etf-shares?exchange=SZ  (exchange=SH|SZ|ALL, date=上交所历史日, code=可选过滤)",
         "fund-flow": "/api/fund-flow?code=510300&days=60  (code 支持 6位/前缀/带市场)",
         research: "/api/research?code=600519&pages=3  (qType=1 行业研报，industry=行业码)",
