@@ -755,7 +755,7 @@ requests.post(
 
    只加给 `API_BASE`（本 Worker）的请求；**直连腾讯 / 东财 / 中证 / 深交所的请求不要带**，不要把密钥发给第三方。
 
-**排障**：返回 401 = 该仓库没配 Secret、workflow 没注入 env、或代码没带 header。`deploy.yml` 部署后的 13 项冒烟已带 header，可作自检基准：13/13 PASS 说明密钥链路通。
+**排障**：返回 401 = 该仓库没配 Secret、workflow 没注入 env、或代码没带 header。`deploy.yml` 部署后的 14 项冒烟已带 header，可作自检基准：14/14 PASS 说明密钥链路通（以 `deploy.yml` 的 check 列表为准）。
 
 **轮换**：同时改 Cloudflare `API_KEY` 与所有下游仓库的 `A_STOCK_API_KEY`，值必须一致；只改一边会全量 401。改完看一次冒烟结果。
 
@@ -791,7 +791,13 @@ requests.post(
 | 2026-11-04 | **新增 `/api/cn-rates`**（累计端点数以 §2 为准）：`bond-yield` 的轻量版——只回尾部窗口（数据量远小于同期全量）、剔除上游「只有日期、各期限全 null」的占位行、派生 `cn_5y_2y` / `cn_30y_10y` 与 bp 口径的变化量。下游 `wj624/etf-lsi` 接入 ⑬国债曲线面板 + 邮件 5.3 小节 |
 | 2026-11-04 | `deploy.yml` 冒烟覆盖 13 个 check（以 `deploy.yml` 的 check 列表为准） |
 | 2026-11-10 | 订正 11-02 换锚后的口径：主要政策利率为隔夜逆回购、调控目标为 DR001，DR007 退居辅助；明确 etf-lsi ⑨ 的 20 日中枢由下游自算，本 Worker 不新增政策利率字段（只做代理） |
-| 2026-11-14 | /api/* 强制校验 X-API-Key（放行 / 与 OPTIONS）；两个账号共 10 个仓库预置 A_STOCK_API_KEY，下游代码与部署冒烟同步携带 header，13/13 PASS |
+| 2026-11-14 | /api/* 强制校验 X-API-Key（放行 / 与 OPTIONS）；两个账号共 10 个仓库预置 A_STOCK_API_KEY，下游代码与部署冒烟同步携带 header，13/13 PASS（当时 13 项，现为 14 项） |
+| 2026-11-22 | `/api/index-valuation` 放行 4 个非 A 股代码 `HKHSTECH / CSIH30269 / NDX / SP500`（精确白名单，不放宽正则）；commit `5a343398a32`，deploy run `44923107444` success |
+| 2026-11-22 | `/api/index-valuation` 返回行新增 `valuation_from`（透传蛋卷 `begin_at`），与 `date` 构成真实分位区间；commit `a282201165c7`，deploy run `44930260294` success |
+| 2026-11-22 | **新增 `/api/csindex-feature`**（中证指数官网 `calMkvSum` → 指数自由流通市值，供 etf-lsi 红利低波赛道做分母）；commit `794f0a31ece9`，deploy run `45006859680` success，冒烟 13→14、14/14 PASS；文档补记 `6e39a987f051` / `f0d7cb20adf8` |
+| 2026-11-22 | **文档审计**：§13 补录上述三条；当前冒烟口径统一为 14 项（历史 13 项保留并标注「当时」）；§2 映射表「无直接对应」九个、文末详细记录与 `deploy.yml` check 列表已对齐 |
+
+> 2026-11-22 三条变更的详细说明见文末「2026-11-22 · ...」三节；更早的「13 项冒烟」是当时口径，当前一律以 `deploy.yml` 的 14 个 check 为准。
 
 ---
 
@@ -816,7 +822,7 @@ Apache-2.0。见 [LICENSE](./LICENSE)。取数逻辑改编自 [simonlin1212/a-st
 | 文件 | 原始缺陷（为什么必须改） | 本次修法 | 依据 / 约束 |
 |---|---|---|---|
 | `worker.js`（9 处） | 错误响应仍带 `public, max-age=300`，错误可能被 CDN 缓存；缺 CORS `Allow-Methods` / `Allow-Headers`；无 `OPTIONS` 预检；2 处裸 `fetch` 无超时会挂死；4 处默认日期用 UTC `toISOString().slice(0,10)`，北京时间凌晨会取到前一天 | 错误响应改 `Cache-Control: no-store`；成功响应补 `Access-Control-Allow-Methods: GET, OPTIONS` 与 `Allow-Headers: Content-Type`；`fetch()` 入口处理 `OPTIONS` 返回 204；裸 fetch 改带超时的 `gfetch(url, headers, 15000)`；默认日期改 `bjToday()`；根索引 `cn-rates` 文案由「利差 bp」改为「期限利差 %（×100 为 bp）」 | §0 铁律「响应结构是契约」「空结果不写 KV」「凭证不进代码」；§3 单位与口径约定 |
-| `.github/workflows/deploy.yml`（2 处） | `cn-rates` 冒烟检查 `'"cn_10y":'`，但响应里并无该字段，会误判；`npm install -g wrangler` 无版本上界，未来主版本可能破坏部署 | 冒烟改验真实字段 `'"count":'`；锁 `wrangler@4` | §8 部署与凭证；部署后 13 个冒烟是唯一线上验收 |
+| `.github/workflows/deploy.yml`（2 处） | `cn-rates` 冒烟检查 `'"cn_10y":'`，但响应里并无该字段，会误判；`npm install -g wrangler` 无版本上界，未来主版本可能破坏部署 | 冒烟改验真实字段 `'"count":'`；锁 `wrangler@4` | §8 部署与凭证；部署后冒烟是唯一线上验收（当时 13 个，现为 14 个，以 `deploy.yml` check 列表为准） |
 | `README.md` | 账号名 `jw624` 拼错；缺 5 个端点契约与对应 TTL 行；下游消费者表缺 `/api/macro-ratios`；冒烟数量与行数/体积等数字过时 | 订正为 `wj624`；补 `commodity-quote` / `futures-kline` / `sge-spot` / `global-index` / `macro-ratios` 契约与 §9 TTL；补下游表；过时数字改定性描述 | §2 端点契约、§9 TTL 一览、§11 下游消费者 |
 | `.gitignore`（新建） | 原本没有忽略规则，`node_modules/`、`.dev.vars`、`.wrangler/`、`*.log`、`__pycache__/` 会污染工作区 | 新建，只忽略运行时/本地产物 | 用户四原则「不自动生成垃圾」 |
 
@@ -849,7 +855,7 @@ Apache-2.0。见 [LICENSE](./LICENSE)。取数逻辑改编自 [simonlin1212/a-st
 2. 本附录 A 表的 9+2 处修复是 2026-11-05 已完成的事项，别当新问题重复改，也别回退。
 3. 绝对不要：改响应字段名/单位/日期格式；让空结果写进 KV；把凭证写进代码；用 force push。
 4. 只做「代理」，不做「功能扩张」；新增端点必须同步 §2 契约、§9 TTL、§11 下游表、deploy.yml 冒烟。
-5. 改完必须：node --check worker.js；push 后确认 Deploy to Cloudflare Workers 的 13 个冒烟全绿。
+5. 改完必须：node --check worker.js；push 后确认 Deploy to Cloudflare Workers 的 14 个冒烟全绿（以 `deploy.yml` check 列表为准）。
 6. 线上写操作：精确 git add、中文 commit、git pull --rebase、绝不 force。
 ```
 ### E. 验证与回滚
@@ -1014,7 +1020,7 @@ ValueError: 'M' is no longer supported for offsets. Please use 'ME' instead.
 - **验证**：`node --check` 通过；本地用真实上游调用返回 `H30269 / 2026-11-20 / 44855.96 亿元 / 4,485,596,000,000 元`。
 - **影响面**：新增只读端点，既有 13 个端点行为不变；鉴权仍走 `X-API-Key === env.API_KEY`。
 - **部署**：commit `794f0a31ece9`，deploy run `45006859680` success；冒烟端点从 13 个增到 14 个（新增 `csindex-feature`），14/14 PASS、0 FAIL。
-- **文档补记**：commit `6e39a987f051` 把新端点补进「与上游对照」表，并将「无直接对应」从八个更正为九个。
+- **文档补记**：commit `6e39a987f051` 把新端点补进「与上游对照」表，并将「无直接对应」从八个更正为九个；本次审计又把 2026-11-22 三条变更补进 §13「变更记录（本仓库）」，当前冒烟口径统一为 14 项。
 - **回滚**：`git revert <commit>`，push 后自动重新部署。
 - **保密**：未写入任何密钥；`A_STOCK_API_KEY` 仍只从 Secrets 读。
 
