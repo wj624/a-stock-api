@@ -1013,7 +1013,8 @@ ValueError: 'M' is no longer supported for offsets. Please use 'ME' instead.
 - **口径**：使用**中证官方自由流通市值**，与 westock 普通流通市值不是同一口径；下游必须在卡片文案里写明「自由流通市值」，不可与普通宽基混称。
 - **验证**：`node --check` 通过；本地用真实上游调用返回 `H30269 / 2026-11-20 / 44855.96 亿元 / 4,485,596,000,000 元`。
 - **影响面**：新增只读端点，既有 13 个端点行为不变；鉴权仍走 `X-API-Key === env.API_KEY`。
-- **部署**：push 触发自动部署；冒烟端点从 13 个增到 14 个（新增 `csindex-feature`）。
+- **部署**：commit `794f0a31ece9`，deploy run `45006859680` success；冒烟端点从 13 个增到 14 个（新增 `csindex-feature`），14/14 PASS、0 FAIL。
+- **文档补记**：commit `6e39a987f051` 把新端点补进「与上游对照」表，并将「无直接对应」从八个更正为九个。
 - **回滚**：`git revert <commit>`，push 后自动重新部署。
 - **保密**：未写入任何密钥；`A_STOCK_API_KEY` 仍只从 Secrets 读。
 
