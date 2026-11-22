@@ -350,13 +350,14 @@
 | `/api/margin-account` | `margin_trading(code)` / `margin_trading_backup` | **4.1** / 备用源 | 东财 / 交易所官方 | 上游是**个股明细**，我们是**市场总量** |
 | `/api/market-turnover` | *（无直接对应）* | — | `qt.gtimg.cn` | 上游有 `tdx_daily_package`(§1.3) 可算，但太重 |
 | `/api/csindex` | *（无直接对应）* | — | `csindex.com.cn` | 上游 §12 只有成分/权重/估值，没有自定义指数日线 |
+| `/api/csindex-feature` | *（无直接对应）* | — | `csindex.com.cn/indexInfo/index-feature` | 上游无「指数自由流通市值」字段；本端点专供 ETF 持仓背离分母 |
 | `/api/index-valuation` | *（上游用 legulegu）* | **§12.1** | `danjuanfunds.com` | 上游走 legulegu（云端 401），我们换蛋卷；字段名不同（`yeild` 是上游拼写） |
 | `/api/cn-liquidity` | *（无直接对应）* | — | `chinamoney.com.cn` | 上游宏观章节只有美债/中债收益率，没有 SHIBOR/DR 资金面 |
 | `/api/etf-premium` | *（无直接对应）* | — | 腾讯价 + 东财净值 | 上游 §12 有「指数估值」，但没有 ETF 折溢价 |
 | `/api/market-breadth` | *（无直接对应）* | — | `push2ex.eastmoney.com` | 上游 §4 有涨停板类函数，但口径/字段不同 |
 | `/api/cn-rates` | `chinabond_yield_curve` 的窄化版 | **11.3** | `datacenter-web.eastmoney.com` | 与 `/api/bond-yield` 同源同表，只回尾部窗口 + 派生利差 |
 
-**「无直接对应」的八个**（`fund-nav` / `market-turnover` / `csindex` / `margin-account` 的市场总量视角，
+**「无直接对应」的九个**（`fund-nav` / `market-turnover` / `csindex` / `csindex-feature` / `margin-account` 的市场总量视角，
 以及 2026-11 新增的 `index-valuation` / `cn-liquidity` / `etf-premium` / `market-breadth`）是我们自己实现的，
 上游更新通常不影响它们；但要留意上游若新增同类端点，优先改用上游写法以便统一维护。
 
